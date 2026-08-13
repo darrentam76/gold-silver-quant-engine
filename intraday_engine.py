@@ -451,13 +451,58 @@ def persist_payload(payload: Dict[str, Any], breakeven_10y: float, period: str) 
         logger.error(f"Supabase persistence failed (non-fatal): {str(e)}")
 
 
-def fetch_history(limit: int = 200) -> Dict[str, Any]:
-    """Reads recent signal snapshots from Supabase, newest first."""
+def fetch_history(limit: int = 200, trading_date: Optional[str] = None) -> Dict[str, Any]:
+    """Reads recent signal snapshots from Supabase, newest first, optionally
+    filtered to a single GMT+8 trading day (YYYY-MM-DD)."""
     client = _get_supabase()
     if client is None:
         raise RuntimeError("Supabase persistence is not configured.")
-    resp = client.table(SUPABASE_TABLE).select("*").order("data_as_of", desc=True).limit(limit).execute()
+    query = client.table(SUPABASE_TABLE).select("*").order("data_as_of", desc=True)
+    if trading_date:
+        query = query.eq("trading_date_gmt8", trading_date)
+    resp = query.limit(limit).execute()
     return {"count": len(resp.data), "rows": resp.data}
+
+
+def fetch_daily_summary(limit: int = 30) -> Dict[str, Any]:
+    """
+    Aggregates signal snapshots by GMT+8 trading day: snapshot count, OK/STALE
+    mix, and signal-tag / arb-flag distributions (newest day first).
+    """
+    client = _get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase persistence is not configured.")
+    resp = client.table(SUPABASE_TABLE).select(
+        "trading_date_gmt8, quality, signal_tag, arb_flag"
+    ).limit(20000).execute()
+
+    from collections import defaultdict
+    daily = defaultdict(lambda: {"count": 0, "ok": 0, "stale": 0,
+                                 "signals": defaultdict(int), "flags": defaultdict(int)})
+    for r in resp.data:
+        d = r.get("trading_date_gmt8")
+        if not d:
+            continue
+        day = daily[d]
+        day["count"] += 1
+        if r.get("quality") == "OK":
+            day["ok"] += 1
+        else:
+            day["stale"] += 1
+        day["signals"][r.get("signal_tag", "NEUTRAL")] += 1
+        day["flags"][r.get("arb_flag", "NONE")] += 1
+
+    summary = []
+    for d, agg in sorted(daily.items(), key=lambda kv: kv[0], reverse=True):
+        summary.append({
+            "trading_date_gmt8": d,
+            "count": agg["count"],
+            "ok": agg["ok"],
+            "stale": agg["stale"],
+            "signal_tags": dict(sorted(agg["signals"].items(), key=lambda kv: -kv[1])),
+            "arb_flags": dict(sorted(agg["flags"].items(), key=lambda kv: -kv[1])),
+        })
+    return {"days": summary[:limit]}
 
 
 # -----------------------------------------------------------------------------
@@ -514,7 +559,10 @@ async def get_signals_endpoint(
 
 
 @app.get("/api/v1/history")
-async def get_history_endpoint(limit: int = Query(200, ge=1, le=5000)):
+async def get_history_endpoint(
+    limit: int = Query(200, ge=1, le=5000),
+    trading_date: Optional[str] = Query(None, description="Filter to one GMT+8 trading day (YYYY-MM-DD)")
+):
     """
     Returns recent signal snapshots from Supabase, newest first.
     Powers the dashboard Analytics tab with persisted time-series data.
@@ -525,10 +573,28 @@ async def get_history_endpoint(limit: int = Query(200, ge=1, le=5000)):
             detail="Supabase persistence is not configured (SUPABASE_URL/SUPABASE_KEY missing)."
         )
     try:
-        return fetch_history(limit=limit)
+        return fetch_history(limit=limit, trading_date=trading_date)
     except Exception as e:
         logger.error(f"History query failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"History query error: {str(e)}")
+
+
+@app.get("/api/v1/history/daily")
+async def get_daily_summary_endpoint(limit: int = Query(30, ge=1, le=365)):
+    """
+    Returns per-GMT+8-trading-day aggregates of persisted signal snapshots,
+    newest day first. Feeds the dashboard daily summary table and date picker.
+    """
+    if not PERSISTENCE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase persistence is not configured (SUPABASE_URL/SUPABASE_KEY missing)."
+        )
+    try:
+        return fetch_daily_summary(limit=limit)
+    except Exception as e:
+        logger.error(f"Daily summary query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Daily summary query error: {str(e)}")
 
 
 @app.get("/api/v1/reject")

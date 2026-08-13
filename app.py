@@ -114,13 +114,27 @@ def fetch_insights(url: str, payload: dict) -> dict:
     except requests.exceptions.RequestException as e:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
 
-def fetch_history(url: str, limit: int = 500) -> dict:
+def fetch_history(url: str, limit: int = 500, trading_date: str = None) -> dict:
     """Fetch persisted signal snapshots from backend /api/v1/history (Supabase-backed)."""
     endpoint = f"{url}/api/v1/history"
+    params = {"limit": limit}
+    if trading_date:
+        params["trading_date"] = trading_date
+    try:
+        response = requests.get(endpoint, params=params, timeout=10)
+        if response.status_code != 200:
+            return {"error": True, "message": f"History API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
+def fetch_daily_summary(url: str, limit: int = 30) -> dict:
+    """Fetch per-trading-day aggregates from backend /api/v1/history/daily."""
+    endpoint = f"{url}/api/v1/history/daily"
     try:
         response = requests.get(endpoint, params={"limit": limit}, timeout=10)
         if response.status_code != 200:
-            return {"error": True, "message": f"History API Error ({response.status_code}): {response.text}"}
+            return {"error": True, "message": f"Daily API Error ({response.status_code}): {response.text}"}
         return {"error": False, "data": response.json()}
     except requests.exceptions.RequestException as e:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
@@ -226,45 +240,71 @@ with tab_regime:
 with tab_analytics:
     st.subheader("Historical Series (Supabase Persistence)")
 
-    history_result = fetch_history(backend_url)
+    daily_result = fetch_daily_summary(backend_url)
 
-    if not history_result["error"] and history_result["data"].get("rows"):
-        df_hist = pd.DataFrame(history_result["data"]["rows"])
-        df_hist = df_hist.sort_values("data_as_of").reset_index(drop=True)
-        df_hist["data_as_of"] = pd.to_datetime(df_hist["data_as_of"])
+    if not daily_result["error"] and daily_result["data"].get("days"):
+        days = daily_result["data"]["days"]
 
-        st.caption(f"**{len(df_hist)} persisted snapshots** from Supabase · newest at bottom")
+        st.caption("**Per-Trading-Day Summary (GMT+8)**")
+        summary_df = pd.DataFrame([
+            {
+                "Trading Date": d["trading_date_gmt8"],
+                "Snapshots": d["count"],
+                "OK": d["ok"],
+                "STALE": d["stale"],
+                "Top Signal": next(iter(d["signal_tags"]), "NEUTRAL"),
+                "Top Flag": next(iter(d["arb_flags"]), "NONE"),
+            }
+            for d in days
+        ])
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-        fig_hist = make_subplots(
-            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-            row_heights=[0.6, 0.4],
-            subplot_titles=("Gold Price vs 10Y Real Rate", "GSR Ratio vs GSR Z-Score"),
-            specs=[[{"secondary_y": True}], [{"secondary_y": True}]]
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=df_hist["data_as_of"], y=df_hist["gold_price"], name="Gold Price ($)", line=dict(color="#F59E0B")),
-            secondary_y=False, row=1, col=1
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=df_hist["data_as_of"], y=df_hist["real_yield_10y"], name="10Y Real Rate (%)", line=dict(color="#3B82F6")),
-            secondary_y=True, row=1, col=1
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=df_hist["data_as_of"], y=df_hist["gsr_ratio"], name="Gold/Silver Ratio", line=dict(color="#34D399")),
-            secondary_y=False, row=2, col=1
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=df_hist["data_as_of"], y=df_hist["gsr_z"], name="GSR Z-Score", line=dict(color="#F472B6")),
-            secondary_y=True, row=2, col=1
-        )
-        fig_hist.update_layout(
-            template="plotly_dark", paper_bgcolor="#1E222D", plot_bgcolor="#0E1117",
-            height=650, showlegend=True, margin=dict(l=20, r=20, t=40, b=20)
-        )
-        st.plotly_chart(fig_hist, width="stretch")
+        date_options = ["All"] + [d["trading_date_gmt8"] for d in days]
+        selected_date = st.selectbox("Trading Date (GMT+8)", options=date_options, index=0)
+        date_param = None if selected_date == "All" else selected_date
 
-        quality_counts = df_hist["quality"].value_counts().to_dict()
-        st.caption("Quality mix: " + ", ".join(f"`{k}`: {v}" for k, v in quality_counts.items()))
+        history_result = fetch_history(backend_url, trading_date=date_param, limit=500)
+
+        if not history_result["error"] and history_result["data"].get("rows"):
+            df_hist = pd.DataFrame(history_result["data"]["rows"])
+            df_hist = df_hist.sort_values("data_as_of").reset_index(drop=True)
+            df_hist["data_as_of"] = pd.to_datetime(df_hist["data_as_of"])
+
+            st.caption(
+                f"**{len(df_hist)} snapshots**"
+                + (f" on **{selected_date}**" if selected_date != "All" else " (all dates)")
+                + " · newest at bottom"
+            )
+
+            fig_hist = make_subplots(
+                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                row_heights=[0.6, 0.4],
+                subplot_titles=("Gold Price vs 10Y Real Rate", "GSR Ratio vs GSR Z-Score"),
+                specs=[[{"secondary_y": True}], [{"secondary_y": True}]]
+            )
+            fig_hist.add_trace(
+                go.Scatter(x=df_hist["data_as_of"], y=df_hist["gold_price"], name="Gold Price ($)", line=dict(color="#F59E0B")),
+                secondary_y=False, row=1, col=1
+            )
+            fig_hist.add_trace(
+                go.Scatter(x=df_hist["data_as_of"], y=df_hist["real_yield_10y"], name="10Y Real Rate (%)", line=dict(color="#3B82F6")),
+                secondary_y=True, row=1, col=1
+            )
+            fig_hist.add_trace(
+                go.Scatter(x=df_hist["data_as_of"], y=df_hist["gsr_ratio"], name="Gold/Silver Ratio", line=dict(color="#34D399")),
+                secondary_y=False, row=2, col=1
+            )
+            fig_hist.add_trace(
+                go.Scatter(x=df_hist["data_as_of"], y=df_hist["gsr_z"], name="GSR Z-Score", line=dict(color="#F472B6")),
+                secondary_y=True, row=2, col=1
+            )
+            fig_hist.update_layout(
+                template="plotly_dark", paper_bgcolor="#1E222D", plot_bgcolor="#0E1117",
+                height=650, showlegend=True, margin=dict(l=20, r=20, t=40, b=20)
+            )
+            st.plotly_chart(fig_hist, width="stretch")
+        else:
+            st.warning("No snapshots found for the selected date.")
     else:
         st.warning("⚠️ No persisted snapshots yet. Run the backend and hit `/api/v1/signals` to archive data, and confirm the `signal_snapshots` table exists in Supabase.")
 
