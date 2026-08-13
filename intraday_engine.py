@@ -1,5 +1,5 @@
 """
-intraday_engine.py - Version 0.2.3
+intraday_engine.py - Version 0.2.4
 ===============================================================================
 Institutional Precious Metals (XAU/XAG) & Yield Curve Quantitative Engine
 
@@ -22,6 +22,7 @@ Architecture Features:
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -34,6 +35,7 @@ load_dotenv()
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -46,7 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger("IntradayQuantEngine")
 
 # System Constants & Disclosure Strings
-ENGINE_VERSION = "intraday-v0.2.3"
+ENGINE_VERSION = "intraday-v0.2.4"
 CACHE_TTL_S = 60
 PROXY_DISCLOSURE = (
     "Intraday 1-minute real rate changes use 10Y nominal yield variance "
@@ -62,8 +64,27 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = "signal_snapshots"
 PERSISTENCE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
+# DeepSeek Executive Synthesis Configuration
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_TIMEOUT_S = 30
+
 WINDOW_1D = 60
 WINDOW_7D = 1440
+
+# Model & Threshold Constants (Spec Steps 4-5)
+REGIME_Z_THRESHOLD = 1.5    # macro regime state machine alert threshold (z = +-1.5)
+REGIME_EXIT_STREAK = 5      # calm bars before macro state reverts to NEUTRAL
+ARB_Z_THRESHOLD = 2.0       # stat-arb signal flag threshold (z = +-2.0)
+ARB_EXIT_STREAK = 3         # calm bars before arbitrage flag reverts to NONE
+FFILL_LIMIT = 3             # max consecutive forward-filled bars before STALE
+BASIS_WINDOW = 30           # rolling mean window for futures/spot basis adjustment
+MIN_INGEST_BARS = 5         # minimum bars required to run the pipeline
+MIN_Z_PERIODS = 10          # floor for rolling Z-score min_periods
+HISTORY_SCAN_LIMIT = 20000  # row cap when aggregating daily summaries
+MARKET_TICKERS = ["GC=F", "SI=F", "^TNX", "^TYX", "^IRX"]
+CBOE_YIELD_SCALE = 0.1      # CBOE yields are scaled x10 (42.50 = 4.250%)
 
 def _resolve_window(period: str) -> int:
     """Spec Step 4: 1d -> 60-bar, 7d -> 1,440-bar rolling window."""
@@ -82,8 +103,8 @@ def _rolling_z_changes(series: pd.Series, window: int = 60) -> pd.Series:
     """
     delta = series.diff()
     # Shift historical window by 1 bar to restrict mean and std to t-1
-    roll_mean = delta.shift(1).rolling(window=window, min_periods=max(10, window // 2)).mean()
-    roll_std = delta.shift(1).rolling(window=window, min_periods=max(10, window // 2)).std(ddof=0)
+    roll_mean = delta.shift(1).rolling(window=window, min_periods=max(MIN_Z_PERIODS, window // 2)).mean()
+    roll_std = delta.shift(1).rolling(window=window, min_periods=max(MIN_Z_PERIODS, window // 2)).std(ddof=0)
     
     # Avoid divide-by-zero
     roll_std = roll_std.replace(0, np.nan)
@@ -98,8 +119,8 @@ def _rolling_z_levels(series: pd.Series, window: int = 60) -> pd.Series:
     
     \text{gsr\_z}_t = \frac{\text{GSR}_t - \mu_{t-1}(\text{GSR})}{\sigma_{t-1}(\text{GSR})}
     """
-    roll_mean = series.shift(1).rolling(window=window, min_periods=max(10, window // 2)).mean()
-    roll_std = series.shift(1).rolling(window=window, min_periods=max(10, window // 2)).std(ddof=0)
+    roll_mean = series.shift(1).rolling(window=window, min_periods=max(MIN_Z_PERIODS, window // 2)).mean()
+    roll_std = series.shift(1).rolling(window=window, min_periods=max(MIN_Z_PERIODS, window // 2)).std(ddof=0)
     
     roll_std = roll_std.replace(0, np.nan)
     z_score = (series - roll_mean) / roll_std
@@ -110,7 +131,7 @@ def evaluate_regime_state(rr_z_series: pd.Series, gold_z_series: pd.Series) -> p
     """
     Macro Regime State Machine with 5-bar exit streak hysteresis.
     
-    Alert Thresholds (z = +-1.5):
+    Alert Thresholds (z = +-REGIME_Z_THRESHOLD):
     - DECOUPLING_ALERT: |rr_z| >= 1.5 AND |gold_z| >= 1.5 AND sign(rr_z) == sign(gold_z)
     - BEARISH_PRESSURE: rr_z >= +1.5
     - BULLISH_CATALYST: rr_z <= -1.5
@@ -124,9 +145,9 @@ def evaluate_regime_state(rr_z_series: pd.Series, gold_z_series: pd.Series) -> p
         if np.isnan(rz) or np.isnan(gz):
             target_state = "NEUTRAL"
         else:
-            is_decoupling = (abs(rz) >= 1.5) and (abs(gz) >= 1.5) and (np.sign(rz) == np.sign(gz))
-            is_bearish = rz >= 1.5
-            is_bullish = rz <= -1.5
+            is_decoupling = (abs(rz) >= REGIME_Z_THRESHOLD) and (abs(gz) >= REGIME_Z_THRESHOLD) and (np.sign(rz) == np.sign(gz))
+            is_bearish = rz >= REGIME_Z_THRESHOLD
+            is_bullish = rz <= -REGIME_Z_THRESHOLD
 
             if is_decoupling:
                 target_state = "DECOUPLING_ALERT"
@@ -143,7 +164,7 @@ def evaluate_regime_state(rr_z_series: pd.Series, gold_z_series: pd.Series) -> p
         else:
             if current_state != "NEUTRAL":
                 calm_streak += 1
-                if calm_streak >= 5:
+                if calm_streak >= REGIME_EXIT_STREAK:
                     current_state = "NEUTRAL"
                     calm_streak = 0
             else:
@@ -170,9 +191,9 @@ def evaluate_arb_flags(gsr_z_series: pd.Series) -> pd.Series:
     for gz in gsr_z_series.values:
         if np.isnan(gz):
             target_flag = "NONE"
-        elif gz >= 2.0:
+        elif gz >= ARB_Z_THRESHOLD:
             target_flag = "GSR_LONG_SILVER_SHORT_GOLD"
-        elif gz <= -2.0:
+        elif gz <= -ARB_Z_THRESHOLD:
             target_flag = "GSR_LONG_GOLD_SHORT_SILVER"
         else:
             target_flag = "NONE"
@@ -183,7 +204,7 @@ def evaluate_arb_flags(gsr_z_series: pd.Series) -> pd.Series:
         else:
             if current_flag != "NONE":
                 calm_streak += 1
-                if calm_streak >= 3:
+                if calm_streak >= ARB_EXIT_STREAK:
                     current_flag = "NONE"
                     calm_streak = 0
             else:
@@ -200,7 +221,7 @@ def evaluate_arb_flags(gsr_z_series: pd.Series) -> pd.Series:
 
 def _fetch_raw_market_data(period: str = "1d") -> pd.DataFrame:
     # Uses GC=F and SI=F directly as primary feeds to prevent 404 noise
-    tickers = ["GC=F", "SI=F", "^TNX", "^TYX", "^IRX"]
+    tickers = MARKET_TICKERS
     data = yf.download(
         tickers=tickers,
         period=period,
@@ -233,7 +254,7 @@ def _fetch_raw_market_data(period: str = "1d") -> pd.DataFrame:
     # Apply CBOE Yield Scaling Rule (* 0.1)
     for yield_ticker in ["^TNX", "^TYX", "^IRX"]:
         if yield_ticker in df_close.columns:
-            df_close[yield_ticker] = df_close[yield_ticker] * 0.1
+            df_close[yield_ticker] = df_close[yield_ticker] * CBOE_YIELD_SCALE
 
     return df_close
 
@@ -252,7 +273,7 @@ def _apply_futures_basis_adjustment(
     
     if spot_valid_count > 0:
         basis = spot - fut
-        rolling_basis = basis.rolling(window=30, min_periods=30).mean()
+        rolling_basis = basis.rolling(window=BASIS_WINDOW, min_periods=BASIS_WINDOW).mean()
         adjusted_fut = fut + rolling_basis
         resolved_series = spot.fillna(adjusted_fut)
     else:
@@ -269,7 +290,7 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
     """
     raw_df = _fetch_raw_market_data(period=period)
     
-    if raw_df.empty or len(raw_df) < 5:
+    if raw_df.empty or len(raw_df) < MIN_INGEST_BARS:
         raise ValueError("Insufficient market data bars fetched from upstream source.")
 
     # 1. Resample to strict 1-minute UTC grid
@@ -280,8 +301,8 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
     silver_series, silver_source = _apply_futures_basis_adjustment(df, "XAGUSD=X", "SI=F")
 
     # 3. Quality Gating (Forward fill limit = 3 bars)
-    gold_ffill = gold_series.ffill(limit=3)
-    silver_ffill = silver_series.ffill(limit=3)
+    gold_ffill = gold_series.ffill(limit=FFILL_LIMIT)
+    silver_ffill = silver_series.ffill(limit=FFILL_LIMIT)
 
     is_stale_gold = gold_ffill.isna()
     is_stale_silver = silver_ffill.isna()
@@ -290,7 +311,7 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
     is_stale_gsr = is_stale_gold | is_stale_silver
 
     # Constraint 3: off-session rates deplete 3-bar budget -> STALE quality
-    is_stale_rates = df["^TNX"].ffill(limit=3).isna()
+    is_stale_rates = df["^TNX"].ffill(limit=FFILL_LIMIT).isna()
     is_stale = is_stale_gsr | is_stale_rates
 
     # Compute GSR on gold/silver-valid bars only (Step 2)
@@ -298,9 +319,9 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
     gsr_series[~is_stale_gsr] = gold_ffill[~is_stale_gsr] / silver_ffill[~is_stale_gsr]
 
     # Forward-fill Treasury feeds with 3-bar budget
-    tnx = df["^TNX"].ffill(limit=3)
-    tyx = df["^TYX"].ffill(limit=3)
-    irx = df["^IRX"].ffill(limit=3)
+    tnx = df["^TNX"].ffill(limit=FFILL_LIMIT)
+    tyx = df["^TYX"].ffill(limit=FFILL_LIMIT)
+    irx = df["^IRX"].ffill(limit=FFILL_LIMIT)
 
     # 4. Yield Curve & Proxy Real Rates
     real_yield_10y = tnx - breakeven_10y
@@ -339,7 +360,7 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
             return None
         return round(float(val), decimals)
 
-    # Cleaned Payload matching Target Output JSON Contract v0.2.3 exactly
+    # Cleaned Payload matching Target Output JSON Contract v0.2.4 exactly
     payload = {
         "signal_tag": str(macro_states.loc[last_idx]),
         "arb_flag": str(arb_flags.loc[last_idx]),
@@ -474,7 +495,7 @@ def fetch_daily_summary(limit: int = 30) -> Dict[str, Any]:
         raise RuntimeError("Supabase persistence is not configured.")
     resp = client.table(SUPABASE_TABLE).select(
         "trading_date_gmt8, quality, signal_tag, arb_flag"
-    ).limit(20000).execute()
+    ).limit(HISTORY_SCAN_LIMIT).execute()
 
     from collections import defaultdict
     daily = defaultdict(lambda: {"count": 0, "ok": 0, "stale": 0,
@@ -503,6 +524,42 @@ def fetch_daily_summary(limit: int = 30) -> Dict[str, Any]:
             "arb_flags": dict(sorted(agg["flags"].items(), key=lambda kv: -kv[1])),
         })
     return {"days": summary[:limit]}
+
+
+def generate_llm_insights(payload: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Best-effort executive synthesis via DeepSeek chat completions.
+    Raises cleanly when the key is missing or the upstream call fails.
+    """
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is not configured.")
+    prompt = (
+        "You are an institutional macro desk analyst. Produce a concise, "
+        "objective executive commentary (max ~120 words) on the current "
+        "gold/silver/real-rates signal state. No disclaimers, no hype.\n\n"
+        f"Signal state payload:\n{json.dumps(payload, indent=2, default=str)}"
+    )
+    response = requests.post(
+        DEEPSEEK_BASE_URL,
+        headers={
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": DEEPSEEK_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 500,
+        },
+        timeout=DEEPSEEK_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    data = response.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected DeepSeek response shape: {str(e)}")
+    return {"model": DEEPSEEK_MODEL, "insight": content.strip()}
 
 
 # -----------------------------------------------------------------------------
@@ -556,6 +613,24 @@ async def get_signals_endpoint(
     except Exception as e:
         logger.error(f"Error generating signals: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Engine calculation error: {str(e)}")
+
+
+@app.post("/api/v1/insights")
+async def get_insights_endpoint(payload: Dict[str, Any]):
+    """
+    Returns executive LLM synthesis for a signal state payload via DeepSeek.
+    Feeds the dashboard 'AI Commentary' tab.
+    """
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="DeepSeek API key is not configured (DEEPSEEK_API_KEY)."
+        )
+    try:
+        return generate_llm_insights(payload)
+    except Exception as e:
+        logger.error(f"Insights generation failed: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Insights generation error: {str(e)}")
 
 
 @app.get("/api/v1/history")

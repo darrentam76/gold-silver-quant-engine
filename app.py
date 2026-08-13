@@ -70,12 +70,12 @@ with st.sidebar:
     )
     
     z_threshold = st.slider(
-        "Z-Score Threshold (σ)", 
-        min_value=1.0, 
+        "Reference Threshold (display only)", 
+        min_value=0.5, 
         max_value=3.0, 
-        value=2.0, 
+        value=1.5, 
         step=0.1,
-        help="Sets reference trigger lines on Z-score charts"
+        help="Draws display-only reference lines on the Z-score chart. Engine thresholds are fixed: macro +/-1.5σ, stat-arb +/-2.0σ."
     )
     
     st.markdown("---")
@@ -88,20 +88,18 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=30)
 def fetch_signals(url: str, breakeven: float) -> dict:
-    """Fetch live signals from backend. Raises on failure to avoid stale/synthetic data."""
+    """Fetch live signals from backend. Pure network call (no st.* calls inside cache)."""
     endpoint = f"{url}/api/v1/signals"
     # Align param name with backend API: `breakeven_10y`
     params = {"breakeven_10y": breakeven}
-    
+
     try:
         response = requests.get(endpoint, params=params, timeout=5)
         if response.status_code != 200:
-            st.error(f"Backend API returned status code {response.status_code}: {response.text}")
-            st.stop()
-        return response.json()
+            return {"error": True, "message": f"Backend API returned status code {response.status_code}: {response.text}"}
+        return {"error": False, "data": response.json()}
     except requests.exceptions.RequestException as e:
-        st.error(f"Failed to connect to backend at `{endpoint}`: {e}")
-        st.stop()
+        return {"error": True, "message": f"Failed to connect to backend at `{endpoint}`: {e}"}
 
 def fetch_insights(url: str, payload: dict) -> dict:
     """Post signal state to LLM endpoint. Returns raw response or surfaces exact error."""
@@ -140,7 +138,11 @@ def fetch_daily_summary(url: str, limit: int = 30) -> dict:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
 
 # Fetch core payload and guard against None
-signals_data = fetch_signals(backend_url, breakeven_input) or {}
+signals_result = fetch_signals(backend_url, breakeven_input) or {"error": True, "message": "No response from fetch_signals."}
+if signals_result["error"]:
+    st.error(signals_result["message"])
+    st.stop()
+signals_data = signals_result["data"]
 
 # -----------------------------------------------------------------------------
 # 4. Header & Status Banner (Spec v0.2.1 Compliance)
@@ -148,7 +150,7 @@ signals_data = fetch_signals(backend_url, breakeven_input) or {}
 st.title("Gold, Silver & Real Rates Engine")
 
 # Extract status contract fields safely
-timestamp = signals_data.get("timestamp", "N/A")
+timestamp = signals_data.get("data_as_of", "N/A")
 quality = signals_data.get("quality", "UNKNOWN")
 data_source_gold = signals_data.get("data_source_gold", "N/A")
 data_source_silver = signals_data.get("data_source_silver", "N/A")
@@ -178,21 +180,21 @@ tab_regime, tab_analytics, tab_llm = st.tabs(["Regime & Signals", "Analytics", "
 with tab_regime:
     col1, col2, col3, col4 = st.columns(4)
     
-    real_rate = signals_data.get("real_rate_10y", 0.0)
+    real_rate = signals_data.get("real_yield_10y", 0.0)
     gold_price = signals_data.get("gold_price", 0.0)
     silver_price = signals_data.get("silver_price", 0.0)
-    gsr = signals_data.get("gsr", 0.0)
+    gsr = signals_data.get("gsr_ratio", 0.0)
     
     col1.metric("10Y Real Rate", f"{real_rate:.2f}%", delta=f"{signals_data.get('rr_z', 0.0):.2f}σ Z", delta_color="inverse")
     col2.metric("Gold Spot", f"${gold_price:,.2f}", delta=f"{signals_data.get('gold_z', 0.0):.2f}σ Z")
-    col3.metric("Silver Spot", f"${silver_price:,.2f}", delta=f"{signals_data.get('silver_z', 0.0):.2f}σ Z")
+    col3.metric("Silver Spot", f"${silver_price:,.2f}")
     col4.metric("Gold/Silver Ratio", f"{gsr:.2f}", delta=f"{signals_data.get('gsr_z', 0.0):.2f}σ Z")
     
     st.markdown("---")
     
     # Regime & Signal Banners
-    regime_tag = signals_data.get("signal_tag", signals_data.get("regime_tag", "NEUTRAL"))
-    arb_flag = signals_data.get("arb_flag", "NO_ARBITRAGE")
+    regime_tag = signals_data.get("signal_tag", "NEUTRAL")
+    arb_flag = signals_data.get("arb_flag", "NONE")
     
     r_col, a_col = st.columns(2)
     with r_col:
@@ -202,13 +204,12 @@ with tab_regime:
         
     st.subheader("Z-Score Velocity Monitor")
     
-    # Wired Z-Score Horizontal Bar Chart
+    # Wired Z-Score Horizontal Bar Chart (engine computes rr_z, gold_z, gsr_z only)
     z_df = pd.DataFrame({
-        "Metric": ["Real Rate Z (rr_z)", "Gold Z (gold_z)", "Silver Z (silver_z)", "GSR Z (gsr_z)"],
+        "Metric": ["Real Rate Z (rr_z)", "Gold Z (gold_z)", "GSR Z (gsr_z)"],
         "Z-Score": [
             signals_data.get("rr_z", 0.0),
             signals_data.get("gold_z", 0.0),
-            signals_data.get("silver_z", 0.0),
             signals_data.get("gsr_z", 0.0)
         ]
     })
