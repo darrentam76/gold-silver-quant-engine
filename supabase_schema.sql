@@ -7,6 +7,8 @@
 create table if not exists public.signal_snapshots (
     id              bigint generated always as identity primary key,
     data_as_of      timestamptz not null unique,   -- engine bar timestamp (upsert key)
+    trading_date_gmt8 date
+                    generated always as ((data_as_of at time zone 'Asia/Hong_Kong')::date) stored,
     signal_tag      text not null,
     arb_flag        text not null,
     quality         text not null,
@@ -30,6 +32,8 @@ create table if not exists public.signal_snapshots (
 -- Indexes for time-series queries
 create index if not exists idx_signal_snapshots_asof
     on public.signal_snapshots (data_as_of desc);
+create index if not exists idx_signal_snapshots_trading_date
+    on public.signal_snapshots (trading_date_gmt8 desc);
 create index if not exists idx_signal_snapshots_quality
     on public.signal_snapshots (quality);
 create index if not exists idx_signal_snapshots_engine_version
