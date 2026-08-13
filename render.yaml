@@ -1,0 +1,16 @@
+# Render blueprint for the FastAPI backend (intraday_engine.py).
+# Render auto-detects this file when the repo is connected.
+services:
+  - type: web
+    name: gold-silver-quant-engine
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn intraday_engine:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false

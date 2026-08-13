@@ -1,8 +1,59 @@
-Institutional Precious Metals (XAU/XAG) & Yield Curve Quantitative Engine
-Overview
-This repository contains the production-grade backend engine (intraday_engine.py v0.2.2) and API contract (/api/v1/signals) for an institutional Gold, Silver, and Real Rates Quantitative Trading System.  
-The system ingests 1-minute market feeds via Yahoo Finance (yfinance), applies robust empty-data guardrails, computes rolling basis spread adjustments, and evaluates dual-modality rolling Z-scores (Macro Velocity vs. Stat-Arb Relative Value). It is designed explicitly for Institutional Portfolio Managers, Quantitative Traders, and Chief Risk Officers.  
-Data Ingestion & Asset MappingThe pipeline processes 1-minute sampled bars (default period="1d", maximum 7-day lookback) for five primary market tickers:  Asset ClassPrimary TickerInternal MappingScaling / Processing RulesGoldGC=FXAUUSD=XFutures-Primary Routing  SilverSI=FXAGUSD=XFutures-Primary Routing  10Y Treasury^TNX-Scaled by 0.1 (CBOE rule)  30Y Treasury^TYX-Scaled by 0.1 (CBOE rule)  3M Treasury^IRX-Scaled by 0.1 (CBOE rule)  Note: A Daily Constant Parameter for 10-Year Breakeven Inflation (breakeven_10y, default 2.28) is injected to calculate real rates.  Core Architecture & System Constraints1. Market Microstructure RulesIntraday Real Rate Equivalence: 1-minute real yield variance ($\Delta \text{Real 10Y}$) is mathematically identical to 1-minute nominal yield variance ($\Delta \text{TNX}$).  Futures-Primary Routing: Futures (GC=F, SI=F) serve as primary feeds to prevent 404 spot errors. A 30-bar rolling mean basis is applied for futures-to-spot continuity.  Off-Session Handling: Non-US session rate ticks deplete the 3-bar forward-fill budget, marking off-hours data as STALE.  Strict Null Guardrails: All upstream payloads are checked for None or .empty attributes to ensure type safety.  2. Pipeline Execution SequenceResampling & Gating: Data is resampled to a 1-minute UTC grid with a 3-bar forward-fill limit. Joint quality gating ensures the Gold/Silver Ratio ($\text{GSR}_t$) is only computed on valid bars to prevent synthetic spikes:
-  $$\text{GSR}_t = \begin{cases} \frac{\text{Gold}_t}{\text{Silver}_t} & \text{if Quality} = \text{OK} \\ \text{NaN} & \text{if Quality} = \text{STALE} \end{cases}$$Yield Curve Construction: Computes 10Y Real Rate Proxy, 10Y3M Slope, and 30Y10Y Slope.  Dual Z-Score Engine: Executes with a strictly $t-1$ historical lookback (zero look-ahead bias).  Macro Velocity (Changes): Computed on 1-minute differences ($\Delta$) for Real Yields and Gold.
-  $$Z_{\Delta, t} = \frac{\Delta X_t - \mu_{t-1}(\Delta X)}{\sigma_{t-1}(\Delta X)}$$Stat-Arb (Levels): Computed directly on raw ratio levels.
-  $$\text{gsr\_z}_t = \frac{\text{GSR}_t - \mu_{t-1}(\text{GSR})}{\sigma_{t-1}(\text{GSR})}$$Hysteresis Buffering: The Macro Regime uses a 5-bar exit streak, while the Stat-Arb flag uses a 3-bar exit streak to prevent boundary flickering at threshold limits.  Infrastructure GuardrailsServer-Side Cache: Implements an in-memory 60-second TTL cache to shield upstream endpoints from shared egress IP 429 rate-limiting.  Pure Functions: Core mathematical operators are isolated as pure functions without clock dependencies to enable deterministic unit testing.  
+# Gold, Silver & Real Rates Quant Engine (v0.2.4)
+
+Institutional precious metals (XAU/XAG) & yield-curve quantitative trading system:
+a FastAPI backend (`intraday_engine.py`) + Streamlit dashboard (`app.py`).
+
+## Architecture
+
+- **Backend (FastAPI)** — 1-minute yfinance ingestion with futures-primary routing
+  (`GC=F`/`SI=F`), 30-bar basis adjustment, joint GSR quality gating, dual-modality
+  Z-scores (macro velocity on changes, stat-arb on levels), dual hysteresis state
+  machines, 60s server-side TTL cache, and Supabase snapshot persistence.
+- **Dashboard (Streamlit)** — live signal terminal, Supabase-backed analytics
+  (per-GMT+8-trading-day summaries + charts), and DeepSeek executive commentary.
+- **Persistence (Supabase)** — `signal_snapshots` table, unique per bar
+  (`data_as_of` upsert), with a derived `trading_date_gmt8` column.
+
+### API
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/signals` | Latest signal state (`breakeven_10y`, `period` params) |
+| `GET /api/v1/history` | Persisted snapshots, newest first (`limit`, `trading_date` params) |
+| `GET /api/v1/history/daily` | Per-GMT+8-trading-day aggregates |
+| `POST /api/v1/insights` | DeepSeek executive synthesis for a signal payload |
+| `GET /api/v1/reject` | Out-of-scope asset rejection |
+
+## Local Run
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate            # Windows
+pip install -r requirements.txt
+copy .env.example .env            # supply SUPABASE_URL, SUPABASE_KEY, DEEPSEEK_API_KEY
+
+.venv\Scripts\python intraday_engine.py   # FastAPI on :8000
+.venv\Scripts\python -m streamlit run app.py   # dashboard on :8501
+```
+
+The dashboard reads `BACKEND_URL` (default `http://localhost:8000`).
+
+## Deployment
+
+### 1. Backend on Render (free)
+
+1. Push this repo to GitHub.
+2. Render → New → Blueprint, connect the repo. `render.yaml` creates the
+   `gold-silver-quant-engine` web service automatically.
+3. Set env vars in the service: `SUPABASE_URL`, `SUPABASE_KEY`, `DEEPSEEK_API_KEY`.
+4. Note the service URL, e.g. `https://gold-silver-quant-engine.onrender.com`.
+
+### 2. Dashboard on Streamlit Community Cloud
+
+1. Sign in to https://share.streamlit.io with your GitHub account.
+2. New app → pick this repo → branch `main` → main file `app.py` → Deploy.
+3. Settings → Secrets → add `BACKEND_URL` = your Render URL
+   (e.g. `https://gold-silver-quant-engine.onrender.com`).
+
+Note: Render's free tier sleeps after ~15 min idle; the first fetch after an idle
+period takes ~1 min (cold start).
