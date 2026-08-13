@@ -23,9 +23,14 @@ Architecture Features:
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import numpy as np
 import pandas as pd
@@ -50,6 +55,12 @@ PROXY_DISCLOSURE = (
 ALLOWED_ASSETS = {"XAUUSD", "XAGUSD", "GOLD", "SILVER", "TNX", "TYX", "IRX", "GSR"}
 
 ALLOWED_PERIODS = {"1d", "5d", "7d"}
+
+# Supabase Persistence Configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_TABLE = "signal_snapshots"
+PERSISTENCE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 WINDOW_1D = 60
 WINDOW_7D = 1440
@@ -379,10 +390,75 @@ class SignalsCacheManager:
             )
             
             self._cache[cache_key] = {"payload": payload, "fetched_at": now}
+
+            # Best-effort archival on cache miss (one row per unique bar)
+            persist_payload(payload, breakeven_10y, period)
             return payload
 
 
 cache_manager = SignalsCacheManager()
+
+# -----------------------------------------------------------------------------
+# Supabase Persistence Layer (Best-Effort Signal Snapshot Archival)
+# -----------------------------------------------------------------------------
+
+_supabase_client = None
+
+
+def _get_supabase():
+    """Lazy-init the sync Supabase client (safe for executor threads)."""
+    global _supabase_client
+    if _supabase_client is None and PERSISTENCE_ENABLED:
+        from supabase import create_client
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
+
+
+def persist_payload(payload: Dict[str, Any], breakeven_10y: float, period: str) -> None:
+    """
+    Upserts one signal snapshot to Supabase keyed on data_as_of.
+    Best-effort: any failure is logged and suppressed so the API never degrades.
+    """
+    if not PERSISTENCE_ENABLED:
+        return
+    try:
+        client = _get_supabase()
+        if client is None:
+            return
+        row = {
+            "data_as_of": payload["data_as_of"],
+            "signal_tag": payload["signal_tag"],
+            "arb_flag": payload["arb_flag"],
+            "quality": payload["quality"],
+            "rr_z": payload.get("rr_z"),
+            "gold_z": payload.get("gold_z"),
+            "gsr_z": payload.get("gsr_z"),
+            "gold_price": payload.get("gold_price"),
+            "silver_price": payload.get("silver_price"),
+            "gsr_ratio": payload.get("gsr_ratio"),
+            "real_yield_10y": payload.get("real_yield_10y"),
+            "slope_10y3m": payload.get("slope_10y3m"),
+            "slope_30y10y": payload.get("slope_30y10y"),
+            "data_source_gold": payload["data_source_gold"],
+            "data_source_silver": payload["data_source_silver"],
+            "breakeven_10y": breakeven_10y,
+            "period": period,
+            "engine_version": payload["engine_version"],
+        }
+        client.table(SUPABASE_TABLE).upsert(row, on_conflict="data_as_of").execute()
+        logger.info(f"Supabase: persisted signal snapshot data_as_of={row['data_as_of']}.")
+    except Exception as e:
+        logger.error(f"Supabase persistence failed (non-fatal): {str(e)}")
+
+
+def fetch_history(limit: int = 200) -> Dict[str, Any]:
+    """Reads recent signal snapshots from Supabase, newest first."""
+    client = _get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase persistence is not configured.")
+    resp = client.table(SUPABASE_TABLE).select("*").order("data_as_of", desc=True).limit(limit).execute()
+    return {"count": len(resp.data), "rows": resp.data}
+
 
 # -----------------------------------------------------------------------------
 # FastAPI API Layer & Out-of-Scope Rejection Protocols
@@ -435,6 +511,24 @@ async def get_signals_endpoint(
     except Exception as e:
         logger.error(f"Error generating signals: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Engine calculation error: {str(e)}")
+
+
+@app.get("/api/v1/history")
+async def get_history_endpoint(limit: int = Query(200, ge=1, le=5000)):
+    """
+    Returns recent signal snapshots from Supabase, newest first.
+    Powers the dashboard Analytics tab with persisted time-series data.
+    """
+    if not PERSISTENCE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase persistence is not configured (SUPABASE_URL/SUPABASE_KEY missing)."
+        )
+    try:
+        return fetch_history(limit=limit)
+    except Exception as e:
+        logger.error(f"History query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"History query error: {str(e)}")
 
 
 @app.get("/api/v1/reject")

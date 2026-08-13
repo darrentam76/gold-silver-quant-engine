@@ -114,6 +114,17 @@ def fetch_insights(url: str, payload: dict) -> dict:
     except requests.exceptions.RequestException as e:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
 
+def fetch_history(url: str, limit: int = 500) -> dict:
+    """Fetch persisted signal snapshots from backend /api/v1/history (Supabase-backed)."""
+    endpoint = f"{url}/api/v1/history"
+    try:
+        response = requests.get(endpoint, params={"limit": limit}, timeout=10)
+        if response.status_code != 200:
+            return {"error": True, "message": f"History API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
 # Fetch core payload and guard against None
 signals_data = fetch_signals(backend_url, breakeven_input) or {}
 
@@ -213,25 +224,49 @@ with tab_regime:
 
 # --- TAB 2: ANALYTICS ---
 with tab_analytics:
-    st.subheader("Historical Series")
-    
-    history_data = signals_data.get("history")
-    
-    if history_data:
-        df_hist = pd.DataFrame(history_data)
-        fig_hist = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_hist.add_trace(
-            go.Scatter(x=df_hist["timestamp"], y=df_hist["gold_price"], name="Gold Price ($)", line=dict(color="#F59E0B")),
-            secondary_y=False
+    st.subheader("Historical Series (Supabase Persistence)")
+
+    history_result = fetch_history(backend_url)
+
+    if not history_result["error"] and history_result["data"].get("rows"):
+        df_hist = pd.DataFrame(history_result["data"]["rows"])
+        df_hist = df_hist.sort_values("data_as_of").reset_index(drop=True)
+        df_hist["data_as_of"] = pd.to_datetime(df_hist["data_as_of"])
+
+        st.caption(f"**{len(df_hist)} persisted snapshots** from Supabase · newest at bottom")
+
+        fig_hist = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+            row_heights=[0.6, 0.4],
+            subplot_titles=("Gold Price vs 10Y Real Rate", "GSR Ratio vs GSR Z-Score"),
+            specs=[[{"secondary_y": True}], [{"secondary_y": True}]]
         )
         fig_hist.add_trace(
-            go.Scatter(x=df_hist["timestamp"], y=df_hist["real_rate"], name="10Y Real Rate (%)", line=dict(color="#3B82F6")),
-            secondary_y=True
+            go.Scatter(x=df_hist["data_as_of"], y=df_hist["gold_price"], name="Gold Price ($)", line=dict(color="#F59E0B")),
+            secondary_y=False, row=1, col=1
         )
-        fig_hist.update_layout(template="plotly_dark", paper_bgcolor="#1E222D", plot_bgcolor="#0E1117", height=450)
+        fig_hist.add_trace(
+            go.Scatter(x=df_hist["data_as_of"], y=df_hist["real_yield_10y"], name="10Y Real Rate (%)", line=dict(color="#3B82F6")),
+            secondary_y=True, row=1, col=1
+        )
+        fig_hist.add_trace(
+            go.Scatter(x=df_hist["data_as_of"], y=df_hist["gsr_ratio"], name="Gold/Silver Ratio", line=dict(color="#34D399")),
+            secondary_y=False, row=2, col=1
+        )
+        fig_hist.add_trace(
+            go.Scatter(x=df_hist["data_as_of"], y=df_hist["gsr_z"], name="GSR Z-Score", line=dict(color="#F472B6")),
+            secondary_y=True, row=2, col=1
+        )
+        fig_hist.update_layout(
+            template="plotly_dark", paper_bgcolor="#1E222D", plot_bgcolor="#0E1117",
+            height=650, showlegend=True, margin=dict(l=20, r=20, t=40, b=20)
+        )
         st.plotly_chart(fig_hist, width="stretch")
+
+        quality_counts = df_hist["quality"].value_counts().to_dict()
+        st.caption("Quality mix: " + ", ".join(f"`{k}`: {v}" for k, v in quality_counts.items()))
     else:
-        st.warning("⚠️ Historical time-series data is not provided by the current backend endpoint.")
+        st.warning("⚠️ No persisted snapshots yet. Run the backend and hit `/api/v1/signals` to archive data, and confirm the `signal_snapshots` table exists in Supabase.")
 
 # --- TAB 3: AI COMMENTARY ---
 with tab_llm:
