@@ -94,7 +94,7 @@ def fetch_signals(url: str, breakeven: float) -> dict:
     params = {"breakeven_10y": breakeven}
 
     try:
-        response = requests.get(endpoint, params=params, timeout=5)
+        response = requests.get(endpoint, params=params, timeout=90)
         if response.status_code != 200:
             return {"error": True, "message": f"Backend API returned status code {response.status_code}: {response.text}"}
         return {"error": False, "data": response.json()}
@@ -119,7 +119,7 @@ def fetch_history(url: str, limit: int = 500, trading_date: str = None) -> dict:
     if trading_date:
         params["trading_date"] = trading_date
     try:
-        response = requests.get(endpoint, params=params, timeout=10)
+        response = requests.get(endpoint, params=params, timeout=90)
         if response.status_code != 200:
             return {"error": True, "message": f"History API Error ({response.status_code}): {response.text}"}
         return {"error": False, "data": response.json()}
@@ -130,7 +130,7 @@ def fetch_daily_summary(url: str, limit: int = 30) -> dict:
     """Fetch per-trading-day aggregates from backend /api/v1/history/daily."""
     endpoint = f"{url}/api/v1/history/daily"
     try:
-        response = requests.get(endpoint, params={"limit": limit}, timeout=10)
+        response = requests.get(endpoint, params={"limit": limit}, timeout=90)
         if response.status_code != 200:
             return {"error": True, "message": f"Daily API Error ({response.status_code}): {response.text}"}
         return {"error": False, "data": response.json()}
