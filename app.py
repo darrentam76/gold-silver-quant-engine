@@ -239,7 +239,7 @@ fig_z.update_layout(
         height=320,
         margin=dict(l=20, r=20, t=30, b=20)
     )
-    st.plotly_chart(fig_z, width="stretch")
+st.plotly_chart(fig_z, width="stretch")
 
 # --- TAB 2: ANALYTICS ---
 with tab_analytics:
