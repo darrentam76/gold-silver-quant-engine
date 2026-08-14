@@ -189,10 +189,10 @@ with tab_regime:
 real_rate = signals_data.get('real_yield_10y') or 0.0
 rr_z = signals_data.get('rr_z') or 0.0
 
-    col1.metric("10Y Real Rate", f"{real_rate:.2f}%", delta=f"{rr_z:.2f}σ Z", delta_color="inverse")
-    col2.metric("Gold Spot", f"${gold_price:,.2f}", delta=f"{signals_data.get('gold_z', 0.0):.2f}σ Z")
-    col3.metric("Silver Spot", f"${silver_price:,.2f}")
-    col4.metric("Gold/Silver Ratio", f"{gsr:.2f}", delta=f"{signals_data.get('gsr_z', 0.0):.2f}σ Z")
+col1.metric("10Y Real Rate", f"{real_rate:.2f}%", delta=f"{rr_z:.2f}σ Z", delta_color="inverse")
+col2.metric("Gold Spot", f"${gold_price:,.2f}", delta=f"{signals_data.get('gold_z', 0.0):.2f}σ Z")
+col3.metric("Silver Spot", f"${silver_price:,.2f}")
+col4.metric("Gold/Silver Ratio", f"{gsr:.2f}", delta=f"{signals_data.get('gsr_z', 0.0):.2f}σ Z")
     
     st.markdown("---")
     
