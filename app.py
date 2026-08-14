@@ -212,27 +212,27 @@ with a_col:
 z_df = pd.DataFrame({
     "Metric": ["Real Rate Z (rr_z)", "Gold Z (gold_z)", "GSR Z (gsr_z)"],
     "Z-Score": [
-        signals_data.get("rr_z", 0.0),
-        signals_data.get("gold_z", 0.0),
-        signals_data.get("gsr_z", 0.0)
-        ]
-    })
+    signals_data.get("rr_z", 0.0),
+    signals_data.get("gold_z", 0.0),
+    signals_data.get("gsr_z", 0.0)
+    ]
+})
     
-    fig_z = px.bar(
-        z_df,
-        x="Z-Score",
-        y="Metric",
-        orientation="h",
-        color="Z-Score",
-        color_continuous_scale=["#EF4444", "#1E222D", "#10B981"],
-        range_x=[-4.0, 4.0]
+fig_z = px.bar(
+    z_df,
+    x="Z-Score",
+    y="Metric",
+    orientation="h",
+    color="Z-Score",
+    color_continuous_scale=["#EF4444", "#1E222D", "#10B981"],
+    range_x=[-4.0, 4.0]
     )
     
-    # Dynamic Threshold Reference Lines
-    fig_z.add_vline(x=z_threshold, line_dash="dash", line_color="#F59E0B", annotation_text=f"+{z_threshold:.1f}σ Threshold")
-    fig_z.add_vline(x=-z_threshold, line_dash="dash", line_color="#F59E0B", annotation_text=f"-{z_threshold:.1f}σ Threshold")
+# Dynamic Threshold Reference Lines
+fig_z.add_vline(x=z_threshold, line_dash="dash", line_color="#F59E0B", annotation_text=f"+{z_threshold:.1f}σ Threshold")
+fig_z.add_vline(x=-z_threshold, line_dash="dash", line_color="#F59E0B", annotation_text=f"-{z_threshold:.1f}σ Threshold")
     
-    fig_z.update_layout(
+fig_z.update_layout(
         template="plotly_dark",
         paper_bgcolor="#1E222D",
         plot_bgcolor="#0E1117",
