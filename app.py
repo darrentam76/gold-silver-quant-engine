@@ -194,27 +194,27 @@ col2.metric("Gold Spot", f"${gold_price:,.2f}", delta=f"{signals_data.get('gold_
 col3.metric("Silver Spot", f"${silver_price:,.2f}")
 col4.metric("Gold/Silver Ratio", f"{gsr:.2f}", delta=f"{signals_data.get('gsr_z', 0.0):.2f}σ Z")
     
-    st.markdown("---")
+st.markdown("---")
     
-    # Regime & Signal Banners
-    regime_tag = signals_data.get("signal_tag", "NEUTRAL")
-    arb_flag = signals_data.get("arb_flag", "NONE")
+# Regime & Signal Banners
+regime_tag = signals_data.get("signal_tag", "NEUTRAL")
+arb_flag = signals_data.get("arb_flag", "NONE")
     
-    r_col, a_col = st.columns(2)
-    with r_col:
-        st.info(f"**Macro Regime Tag:** `{regime_tag}`")
-    with a_col:
-        st.success(f"**Stat-Arb Flag:** `{arb_flag}`")
+r_col, a_col = st.columns(2)
+with r_col:
+    st.info(f"**Macro Regime Tag:** `{regime_tag}`")
+with a_col:
+    st.success(f"**Stat-Arb Flag:** `{arb_flag}`")
         
     st.subheader("Z-Score Velocity Monitor")
     
-    # Wired Z-Score Horizontal Bar Chart (engine computes rr_z, gold_z, gsr_z only)
-    z_df = pd.DataFrame({
-        "Metric": ["Real Rate Z (rr_z)", "Gold Z (gold_z)", "GSR Z (gsr_z)"],
-        "Z-Score": [
-            signals_data.get("rr_z", 0.0),
-            signals_data.get("gold_z", 0.0),
-            signals_data.get("gsr_z", 0.0)
+# Wired Z-Score Horizontal Bar Chart (engine computes rr_z, gold_z, gsr_z only)
+z_df = pd.DataFrame({
+    "Metric": ["Real Rate Z (rr_z)", "Gold Z (gold_z)", "GSR Z (gsr_z)"],
+    "Z-Score": [
+        signals_data.get("rr_z", 0.0),
+        signals_data.get("gold_z", 0.0),
+        signals_data.get("gsr_z", 0.0)
         ]
     })
     
