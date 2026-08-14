@@ -180,19 +180,22 @@ tab_regime, tab_analytics, tab_llm = st.tabs(["Regime & Signals", "Analytics", "
 with tab_regime:
     col1, col2, col3, col4 = st.columns(4)
     
-    real_rate = signals_data.get("real_yield_10y", 0.0)
-    gold_price = signals_data.get("gold_price", 0.0)
-    silver_price = signals_data.get("silver_price", 0.0)
-    gsr = signals_data.get("gsr_ratio", 0.0)
-    
-    # Safely extract values, defaulting to 0.0 if they are None
+# 1. Safely extract ALL values first, defaulting to 0.0 if missing
 real_rate = signals_data.get('real_yield_10y') or 0.0
 rr_z = signals_data.get('rr_z') or 0.0
+gold_price = signals_data.get('gold_price') or 0.0
+gold_z = signals_data.get('gold_z') or 0.0
+silver_price = signals_data.get('silver_price') or 0.0
+gsr_ratio = signals_data.get('gsr_ratio') or 0.0
+gsr_z = signals_data.get('gsr_z') or 0.0
 
+# 2. Render the metrics (adjust col numbers if your app only uses 3 columns)
 col1.metric("10Y Real Rate", f"{real_rate:.2f}%", delta=f"{rr_z:.2f}σ Z", delta_color="inverse")
-col2.metric("Gold Spot", f"${gold_price:,.2f}", delta=f"{signals_data.get('gold_z', 0.0):.2f}σ Z")
+col2.metric("Gold Spot", f"${gold_price:,.2f}", delta=f"{gold_z:.2f}σ Z")
 col3.metric("Silver Spot", f"${silver_price:,.2f}")
-col4.metric("Gold/Silver Ratio", f"{gsr:.2f}", delta=f"{signals_data.get('gsr_z', 0.0):.2f}σ Z")
+col4.metric("Gold/Silver Ratio", f"{gsr_ratio:.2f}", delta=f"{gsr_z:.2f}σ Z", delta_color="inverse")
+    
+    
     
 st.markdown("---")
     
