@@ -84,7 +84,7 @@ MIN_INGEST_BARS = 5         # minimum bars required to run the pipeline
 MIN_Z_PERIODS = 10          # floor for rolling Z-score min_periods
 HISTORY_SCAN_LIMIT = 20000  # row cap when aggregating daily summaries
 MARKET_TICKERS = ["GC=F", "SI=F", "^TNX", "^TYX", "^IRX"]
-CBOE_YIELD_SCALE = 0.1      # CBOE yields are scaled x10 (42.50 = 4.250%)
+CBOE_YIELD_SCALE = 0.1      # legacy constant retained for docs; scaling is now auto-detected
 
 def _resolve_window(period: str) -> int:
     """Spec Step 4: 1d -> 60-bar, 7d -> 1,440-bar rolling window."""
@@ -219,6 +219,21 @@ def evaluate_arb_flags(gsr_z_series: pd.Series) -> pd.Series:
 # Data Pipeline & Ingestion Architecture
 # -----------------------------------------------------------------------------
 
+def _normalize_yield_series(values: pd.Series) -> pd.Series:
+    """Normalize CBOE yield feeds to percent.
+
+    yfinance behavior varies by version: historically ``^TNX``/``^TYX``/``^IRX``
+    were returned CBOE-scaled x10 (42.50 = 4.250%); yfinance >=1.0 returns the
+    percent directly (4.25). Heuristic: a latest value above 20 is an x10 form.
+    """
+    latest = values.dropna()
+    if latest.empty:
+        return values
+    if float(latest.iloc[-1]) > 20.0:
+        return values * CBOE_YIELD_SCALE
+    return values
+
+
 def _fetch_raw_market_data(period: str = "1d") -> pd.DataFrame:
     # Uses GC=F and SI=F directly as primary feeds to prevent 404 noise
     tickers = MARKET_TICKERS
@@ -251,10 +266,11 @@ def _fetch_raw_market_data(period: str = "1d") -> pd.DataFrame:
     if "SI=F" in df_close.columns:
         df_close["XAGUSD=X"] = df_close["SI=F"]
 
-    # Apply CBOE Yield Scaling Rule (* 0.1)
+    # Apply CBOE Yield Scaling Rule (auto-detect: yfinance >=1.0 returns yields
+    # in percent directly; older versions returned the CBOE x10 form 42.50 = 4.25%)
     for yield_ticker in ["^TNX", "^TYX", "^IRX"]:
         if yield_ticker in df_close.columns:
-            df_close[yield_ticker] = df_close[yield_ticker] * CBOE_YIELD_SCALE
+            df_close[yield_ticker] = _normalize_yield_series(df_close[yield_ticker])
 
     return df_close
 
@@ -418,6 +434,211 @@ class SignalsCacheManager:
 
 
 cache_manager = SignalsCacheManager()
+
+# -----------------------------------------------------------------------------
+# Live Futures Quote Layer (10-Second TTL, Independent of STALE Signal Gating)
+# -----------------------------------------------------------------------------
+
+LIVE_QUOTE_TTL_S = 10
+LIVE_FRESH_MIN = 60  # gold/silver feed considered live if last tick < 60 min ago
+
+
+def _fetch_live_quotes(breakeven_10y: float = 2.28) -> Dict[str, Any]:
+    """
+    Returns the latest futures prices (GC=F gold, SI=F silver) plus CBOE
+    Treasury yields from the 1-minute feed, without the STALE signal gate.
+    Also reports per-feed freshness (minutes since last tick) so the dashboard
+    can show whether a feed is live, off-session, or frozen (weekend/holiday).
+    """
+    df = _fetch_raw_market_data(period="1d")
+    if df.empty:
+        raise ValueError("No market data available for live quotes.")
+
+    df = df.dropna(how="all")
+    if df.empty:
+        raise ValueError("No live market data available for live quotes.")
+
+    last = df.iloc[-1]
+    latest_ts = df.index.max()
+
+    def _clean(col: str, decimals: int = 4) -> Optional[float]:
+        series = df[col].dropna()
+        if series.empty:
+            return None
+        val = series.iloc[-1]
+        if pd.isna(val) or np.isinf(val):
+            return None
+        return round(float(val), decimals)
+
+    def _age_min(col: str) -> Optional[float]:
+        series = df[col].dropna()
+        if series.empty:
+            return None
+        ts = series.index[-1]
+        if ts.tzinfo is None or latest_ts.tzinfo is None or ts.tzinfo == latest_ts.tzinfo:
+            delta = latest_ts - ts
+        else:
+            delta = latest_ts.tz_convert(ts.tz) - ts
+        return round(delta.total_seconds() / 60.0, 1)
+
+    # Wall-clock staleness + weekend check (feed max timestamp can look "fresh"
+    # even on a closed market, since it equals the last session close).
+    now_utc = pd.Timestamp.now(tz="UTC")
+    if latest_ts.tzinfo is None:
+        latest_utc = latest_ts.tz_localize("UTC")
+    else:
+        latest_utc = latest_ts.tz_convert("UTC")
+    age_now_min = (now_utc - latest_utc).total_seconds() / 60.0
+    is_weekend = now_utc.dayofweek >= 5
+    market_open = bool(age_now_min < LIVE_FRESH_MIN and not is_weekend)
+
+    tnx = _clean("^TNX", 3)
+    tyx = _clean("^TYX", 3)
+    irx = _clean("^IRX", 3)
+    gold = _clean("GC=F", 2)
+    silver = _clean("SI=F", 2)
+
+    gsr = round(gold / silver, 2) if gold and silver else None
+    real_yield_10y = round(tnx - breakeven_10y, 3) if tnx is not None else None
+    slope_10y3m = round(tnx - irx, 3) if (tnx is not None and irx is not None) else None
+    slope_30y10y = round(tyx - tnx, 3) if (tyx is not None and tnx is not None) else None
+
+    gold_age = _age_min("GC=F")
+
+    return {
+        "gold_futures": gold,
+        "silver_futures": silver,
+        "gsr_ratio": gsr,
+        "us10y_yield": tnx,
+        "us30y_yield": tyx,
+        "us3m_yield": irx,
+        "real_yield_10y": real_yield_10y,
+        "slope_10y3m": slope_10y3m,
+        "slope_30y10y": slope_30y10y,
+        "market_open": market_open,
+        "freshness_min": {
+            "gold": gold_age,
+            "silver": _age_min("SI=F"),
+            "us10y": _age_min("^TNX"),
+            "us30y": _age_min("^TYX"),
+            "us3m": _age_min("^IRX"),
+        },
+        "data_as_of": latest_ts.isoformat(),
+        "engine_version": ENGINE_VERSION,
+    }
+
+
+class LiveQuotesManager:
+    """Thread-safe 10-second TTL cache for the live futures quote endpoint."""
+
+    def __init__(self, ttl_seconds: int = LIVE_QUOTE_TTL_S):
+        self.ttl = ttl_seconds
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_quotes(self, breakeven_10y: float) -> Dict[str, Any]:
+        async with self._lock:
+            now = time.time()
+            cache_key = str(breakeven_10y)
+
+            cached = self._cache.get(cache_key)
+            if cached and (now - cached["fetched_at"] < self.ttl):
+                return cached["payload"]
+
+            loop = asyncio.get_running_loop()
+            payload = await loop.run_in_executor(None, _fetch_live_quotes, breakeven_10y)
+            self._cache[cache_key] = {"payload": payload, "fetched_at": now}
+            return payload
+
+
+live_quotes_manager = LiveQuotesManager()
+
+# -----------------------------------------------------------------------------
+# Yearly History Layer (Daily Bars, 1-Hour TTL Cache)
+# -----------------------------------------------------------------------------
+
+YEARLY_HISTORY_TTL_S = 3600
+ALLOWED_HISTORY_PERIODS = {"1y", "6mo", "3mo", "1mo"}
+
+
+def _fetch_yearly_history(period: str = "1y") -> Dict[str, Any]:
+    """
+    Returns daily bars for gold/silver futures, the GSR, and Treasury yields
+    over the requested lookback. Serves the dashboard '1Y history' charts.
+    """
+    data = yf.download(
+        tickers=MARKET_TICKERS,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        progress=False,
+        auto_adjust=True,
+    )
+    if data is None or data.empty:
+        raise ValueError("No yearly market history available.")
+
+    df_close = pd.DataFrame(index=data.index)
+    for t in MARKET_TICKERS:
+        try:
+            if isinstance(data.columns, pd.MultiIndex):
+                df_close[t] = data[t]["Close"]
+            else:
+                df_close[t] = data["Close"][t] if "Close" in data else data[t]
+        except KeyError:
+            df_close[t] = np.nan
+
+    for yield_ticker in ["^TNX", "^TYX", "^IRX"]:
+        df_close[yield_ticker] = _normalize_yield_series(df_close[yield_ticker])
+
+    gsr = (df_close["GC=F"] / df_close["SI=F"]).replace([np.inf, -np.inf], np.nan)
+    df_close["GSR"] = gsr
+
+    df = df_close.dropna(how="all")
+    rows = []
+    for idx, row in df.iterrows():
+        def _val(col: str, decimals: int) -> Optional[float]:
+            v = row.get(col)
+            if pd.isna(v) or np.isinf(v):
+                return None
+            return round(float(v), decimals)
+
+        rows.append(
+            {
+                "date": idx.isoformat(),
+                "gold": _val("GC=F", 2),
+                "silver": _val("SI=F", 2),
+                "gsr": _val("GSR", 2),
+                "us10y": _val("^TNX", 3),
+                "us30y": _val("^TYX", 3),
+                "us3m": _val("^IRX", 3),
+            }
+        )
+    return {"period": period, "count": len(rows), "rows": rows}
+
+
+class YearlyHistoryManager:
+    """Thread-safe 1-hour TTL cache for the yearly daily-bar history endpoint."""
+
+    def __init__(self, ttl_seconds: int = YEARLY_HISTORY_TTL_S):
+        self.ttl = ttl_seconds
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_history(self, period: str) -> Dict[str, Any]:
+        async with self._lock:
+            now = time.time()
+
+            cached = self._cache.get(period)
+            if cached and (now - cached["fetched_at"] < self.ttl):
+                return cached["payload"]
+
+            loop = asyncio.get_running_loop()
+            payload = await loop.run_in_executor(None, _fetch_yearly_history, period)
+            self._cache[period] = {"payload": payload, "fetched_at": now}
+            return payload
+
+
+yearly_history_manager = YearlyHistoryManager()
 
 # -----------------------------------------------------------------------------
 # Supabase Persistence Layer (Best-Effort Signal Snapshot Archival)
@@ -687,6 +908,39 @@ async def reject_out_of_scope(asset: str = Query(...)):
             )
         )
     return {"status": "ALLOWED", "asset": clean_asset}
+
+
+@app.get("/api/v1/live")
+async def get_live_quotes_endpoint(breakeven_10y: float = Query(2.28)):
+    """
+    Returns the latest gold/silver FUTURES prices and US Treasury yields with
+    per-feed freshness, independent of the STALE signal gate. Protected by a
+    10-second server-side TTL cache. Feeds the dashboard 'Live prices' tab.
+    """
+    try:
+        return await live_quotes_manager.get_quotes(breakeven_10y=breakeven_10y)
+    except Exception as e:
+        logger.error(f"Live quotes generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Live quotes error: {str(e)}")
+
+
+@app.get("/api/v1/live/yearly")
+async def get_yearly_history_endpoint(period: str = Query("1y")):
+    """
+    Returns daily bars for gold/silver futures, GSR, and Treasury yields over
+    the lookback period (1y, 6mo, 3mo, 1mo). Protected by a 1-hour server-side
+    TTL cache. Feeds the dashboard '1Y history' charts.
+    """
+    if period not in ALLOWED_HISTORY_PERIODS:
+        raise HTTPException(
+            status_code=400,
+            detail="period must be one of: 1y, 6mo, 3mo, 1mo"
+        )
+    try:
+        return await yearly_history_manager.get_history(period=period)
+    except Exception as e:
+        logger.error(f"Yearly history generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Yearly history error: {str(e)}")
 
 
 if __name__ == "__main__":
