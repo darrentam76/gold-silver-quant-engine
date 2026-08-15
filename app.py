@@ -151,6 +151,33 @@ def fetch_yearly_history(url: str, period: str = "1y") -> dict:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
 
 
+def fetch_price_history(url: str, symbol: str = None, limit: int = 1000) -> dict:
+    """Fetch archived daily OHLCV rows from backend /api/v1/price-history (Supabase-backed)."""
+    endpoint = f"{url}/api/v1/price-history"
+    params = {"limit": limit}
+    if symbol:
+        params["symbol"] = symbol
+    try:
+        response = requests.get(endpoint, params=params, timeout=90)
+        if response.status_code != 200:
+            return {"error": True, "message": f"Archive API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
+
+def backfill_price_history(url: str, days: int = 400) -> dict:
+    """Trigger a Supabase archive backfill of daily OHLCV via POST."""
+    endpoint = f"{url}/api/v1/price-history/backfill"
+    try:
+        response = requests.post(endpoint, params={"days": days}, timeout=180)
+        if response.status_code != 200:
+            return {"error": True, "message": f"Backfill API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
+
 # Fetch core payload and guard against None
 signals_result = fetch_signals(backend_url, breakeven_input) or {"error": True, "message": "No response from fetch_signals."}
 if signals_result["error"]:
@@ -411,6 +438,52 @@ def yearly_history_panel():
     )
     fig_yearly.update_layout(height=780, showlegend=True, margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig_yearly, width="stretch")
+
+    st.divider()
+    st.subheader("Supabase price archive")
+
+    archive = fetch_price_history(backend_url, limit=1)
+    if archive["error"]:
+        st.warning(f"Archive status unavailable: {archive['message']}", icon=":material/info:")
+        archive_total = 0
+    else:
+        archive_total = archive["data"].get("total", 0)
+
+    st.caption(
+        f"**{archive_total:,} archived OHLCV rows** in `price_history_daily`. Daily bars are "
+        "mirrored automatically on every fresh 1Y fetch (upsert), so the archive stays current "
+        "as long as the dashboard is visited. Use the button to seed or refresh it explicitly."
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button(":material/archive: Backfill archive (400 days)", width="stretch"):
+            with st.spinner("Downloading & archiving daily bars (may take ~1 min)..."):
+                res = backfill_price_history(backend_url, days=400)
+            if res["error"]:
+                st.error(res["message"], icon=":material/error:")
+            else:
+                st.success(
+                    f"Archived {res['data']['rows_written']:,} rows across "
+                    f"{len(res['data']['symbols'])} symbols up to {res['data']['latest_date']}.",
+                    icon=":material/check_circle:",
+                )
+                st.cache_data.clear()
+                st.rerun()
+    with col_b:
+        if st.button(":material/download: Load archive as CSV", width="stretch"):
+            rows_all = fetch_price_history(backend_url, limit=5000)
+            if rows_all["error"]:
+                st.error(rows_all["message"], icon=":material/error:")
+            else:
+                pdf = pd.DataFrame(rows_all["data"]["rows"])
+                st.download_button(
+                    "Save price_history_daily.csv",
+                    data=pdf.to_csv(index=False),
+                    file_name="price_history_daily.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
 
 
 with tab_yearly:

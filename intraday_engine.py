@@ -25,8 +25,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -62,6 +63,7 @@ ALLOWED_PERIODS = {"1d", "5d", "7d"}
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = "signal_snapshots"
+PRICE_HISTORY_TABLE = "price_history_daily"
 PERSISTENCE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 # DeepSeek Executive Synthesis Configuration
@@ -560,44 +562,85 @@ live_quotes_manager = LiveQuotesManager()
 YEARLY_HISTORY_TTL_S = 3600
 ALLOWED_HISTORY_PERIODS = {"1y", "6mo", "3mo", "1mo"}
 
+_last_daily_frame: Optional[pd.DataFrame] = None
+
+
+def _download_daily_ohlcv(
+    period: Optional[str] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Downloads daily OHLCV for all MARKET_TICKERS (yields normalized, plus a
+    computed GSR close) into a (ticker, field) MultiIndex frame.
+
+    Accepts either a yfinance ``period`` token (1y/6mo/3mo/1mo) or explicit
+    ``start``/``end`` datetimes for arbitrary-length backfills.
+    """
+    kwargs: Dict[str, Any] = {
+        "tickers": MARKET_TICKERS,
+        "interval": "1d",
+        "group_by": "ticker",
+        "progress": False,
+        "auto_adjust": True,
+    }
+    if period:
+        kwargs["period"] = period
+    else:
+        kwargs["start"] = start.strftime("%Y-%m-%d") if start else None
+        kwargs["end"] = (end + timedelta(days=1)).strftime("%Y-%m-%d") if end else None
+
+    data = yf.download(**kwargs)
+    if data is None or data.empty:
+        raise ValueError("No daily market history available.")
+
+    columns = pd.MultiIndex.from_product(
+        [MARKET_TICKERS, ["Open", "High", "Low", "Close", "Volume"]]
+    )
+    frame = pd.DataFrame(index=data.index, columns=columns, dtype=float)
+
+    if isinstance(data.columns, pd.MultiIndex):
+        for t in MARKET_TICKERS:
+            for f in ["Open", "High", "Low", "Close", "Volume"]:
+                try:
+                    frame[(t, f)] = data[t][f].astype(float)
+                except (KeyError, TypeError):
+                    pass
+    else:
+        for f in ["Open", "High", "Low", "Close", "Volume"]:
+            if f in data.columns:
+                try:
+                    frame[(MARKET_TICKERS[0], f)] = data[f].astype(float)
+                except TypeError:
+                    pass
+
+    for yield_ticker in ["^TNX", "^TYX", "^IRX"]:
+        for f in ["Open", "High", "Low", "Close"]:
+            frame[(yield_ticker, f)] = _normalize_yield_series(frame[(yield_ticker, f)])
+
+    gsr_close = (frame[("GC=F", "Close")] / frame[("SI=F", "Close")]).replace(
+        [np.inf, -np.inf], np.nan
+    )
+    frame[("GSR", "Close")] = gsr_close
+    for f in ["Open", "High", "Low", "Volume"]:
+        frame[("GSR", f)] = np.nan
+
+    return frame
+
 
 def _fetch_yearly_history(period: str = "1y") -> Dict[str, Any]:
     """
     Returns daily bars for gold/silver futures, the GSR, and Treasury yields
     over the requested lookback. Serves the dashboard '1Y history' charts.
+    Also snapshots the raw OHLCV frame for opportunistic archiving.
     """
-    data = yf.download(
-        tickers=MARKET_TICKERS,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        progress=False,
-        auto_adjust=True,
-    )
-    if data is None or data.empty:
-        raise ValueError("No yearly market history available.")
+    global _last_daily_frame
+    frame = _download_daily_ohlcv(period=period)
+    _last_daily_frame = frame
 
-    df_close = pd.DataFrame(index=data.index)
-    for t in MARKET_TICKERS:
-        try:
-            if isinstance(data.columns, pd.MultiIndex):
-                df_close[t] = data[t]["Close"]
-            else:
-                df_close[t] = data["Close"][t] if "Close" in data else data[t]
-        except KeyError:
-            df_close[t] = np.nan
-
-    for yield_ticker in ["^TNX", "^TYX", "^IRX"]:
-        df_close[yield_ticker] = _normalize_yield_series(df_close[yield_ticker])
-
-    gsr = (df_close["GC=F"] / df_close["SI=F"]).replace([np.inf, -np.inf], np.nan)
-    df_close["GSR"] = gsr
-
-    df = df_close.dropna(how="all")
     rows = []
-    for idx, row in df.iterrows():
-        def _val(col: str, decimals: int) -> Optional[float]:
-            v = row.get(col)
+    for idx, row in frame.iterrows():
+        def _val(ticker: str, decimals: int) -> Optional[float]:
+            v = row[(ticker, "Close")]
             if pd.isna(v) or np.isinf(v):
                 return None
             return round(float(v), decimals)
@@ -635,6 +678,10 @@ class YearlyHistoryManager:
             loop = asyncio.get_running_loop()
             payload = await loop.run_in_executor(None, _fetch_yearly_history, period)
             self._cache[period] = {"payload": payload, "fetched_at": now}
+
+            # Opportunistic archive: whenever a fresh daily fetch happens, mirror
+            # the OHLCV bars into Supabase so a persistent archive accumulates.
+            _launch_archive(_last_daily_frame)
             return payload
 
 
@@ -745,6 +792,117 @@ def fetch_daily_summary(limit: int = 30) -> Dict[str, Any]:
             "arb_flags": dict(sorted(agg["flags"].items(), key=lambda kv: -kv[1])),
         })
     return {"days": summary[:limit]}
+
+
+# -----------------------------------------------------------------------------
+# Daily Price History Archive (persistent OHLCV mirror in Supabase)
+# -----------------------------------------------------------------------------
+
+ARCHIVE_SYMBOLS = MARKET_TICKERS + ["GSR"]
+
+
+def _num(v: Any, decimals: int = 4) -> Optional[float]:
+    """Coerces a scalar to a rounded float, returning None for missing values."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(f) or np.isinf(f):
+        return None
+    return round(f, decimals)
+
+
+def _frame_to_archive_rows(frame: pd.DataFrame) -> list:
+    """Flattens the (ticker, field) OHLCV frame into per-symbol daily rows."""
+    rows = []
+    for t in ARCHIVE_SYMBOLS:
+        for idx, r in frame.iterrows():
+            close = r[(t, "Close")]
+            if pd.isna(close):
+                continue
+            rows.append({
+                "symbol": t,
+                "trading_date": idx.date().isoformat(),
+                "open": _num(r[(t, "Open")]),
+                "high": _num(r[(t, "High")]),
+                "low": _num(r[(t, "Low")]),
+                "close": _num(close),
+                "volume": _num(r[(t, "Volume")], 0),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+    return rows
+
+
+def _archive_daily_rows(rows: list) -> Dict[str, Any]:
+    """Upserts daily price rows into Supabase keyed on (symbol, trading_date)."""
+    if not rows:
+        return {"rows_written": 0}
+    client = _get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase persistence is not configured.")
+    written = 0
+    for i in range(0, len(rows), 500):
+        chunk = rows[i:i + 500]
+        client.table(PRICE_HISTORY_TABLE).upsert(
+            chunk, on_conflict="symbol,trading_date"
+        ).execute()
+        written += len(chunk)
+    return {"rows_written": written}
+
+
+def _backfill_daily_archive(days: int) -> Dict[str, Any]:
+    """Downloads ``days`` of daily OHLCV and persists them to Supabase."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    frame = _download_daily_ohlcv(start=start, end=end)
+    rows = _frame_to_archive_rows(frame)
+    result = _archive_daily_rows(rows)
+    result["days"] = days
+    result["symbols"] = list(ARCHIVE_SYMBOLS)
+    result["latest_date"] = frame.index.max().date().isoformat()
+    return result
+
+
+def _launch_archive(frame: Optional[pd.DataFrame]) -> None:
+    """Fire-and-forget background mirror of a freshly fetched OHLCV frame."""
+    if frame is None or frame.empty or not PERSISTENCE_ENABLED:
+        return
+    rows = _frame_to_archive_rows(frame)
+    if not rows:
+        return
+
+    def _job():
+        try:
+            res = _archive_daily_rows(rows)
+            logger.info(f"Supabase: archived {res['rows_written']} daily price rows.")
+        except Exception as e:
+            logger.error(f"Supabase price archive failed (non-fatal): {str(e)}")
+
+    threading.Thread(target=_job, daemon=True).start()
+
+
+def fetch_price_history(
+    symbol: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = 1000,
+) -> Dict[str, Any]:
+    """Reads archived daily price rows from Supabase, newest date first."""
+    client = _get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase persistence is not configured.")
+    query = client.table(PRICE_HISTORY_TABLE).select("*", count="exact").order("trading_date", desc=True)
+    if symbol:
+        query = query.eq("symbol", symbol)
+    if start:
+        query = query.gte("trading_date", start)
+    if end:
+        query = query.lte("trading_date", end)
+    resp = query.limit(limit).execute()
+    total = resp.count if getattr(resp, "count", None) is not None else len(resp.data)
+    return {"count": len(resp.data), "total": total, "rows": resp.data}
 
 
 def generate_llm_insights(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -941,6 +1099,48 @@ async def get_yearly_history_endpoint(period: str = Query("1y")):
     except Exception as e:
         logger.error(f"Yearly history generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Yearly history error: {str(e)}")
+
+
+@app.post("/api/v1/price-history/backfill")
+async def backfill_price_history_endpoint(days: int = Query(400, ge=30, le=2500)):
+    """
+    Downloads ``days`` of daily OHLCV (gold/silver futures, CBOE yields, GSR)
+    and persists them into the Supabase price archive (idempotent upsert).
+    """
+    if not PERSISTENCE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase persistence is not configured (SUPABASE_URL/SUPABASE_KEY missing)."
+        )
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _backfill_daily_archive, days)
+    except Exception as e:
+        logger.error(f"Price archive backfill failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Price archive backfill error: {str(e)}")
+
+
+@app.get("/api/v1/price-history")
+async def get_price_history_endpoint(
+    symbol: Optional[str] = Query(None, description="One of GC=F, SI=F, ^TNX, ^TYX, ^IRX, GSR"),
+    start: Optional[str] = Query(None, description="Inclusive start date (YYYY-MM-DD)"),
+    end: Optional[str] = Query(None, description="Inclusive end date (YYYY-MM-DD)"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    """
+    Returns archived daily price rows from the Supabase price_history_daily
+    table, newest date first. Powers the dashboard archive viewer/download.
+    """
+    if not PERSISTENCE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase persistence is not configured (SUPABASE_URL/SUPABASE_KEY missing)."
+        )
+    try:
+        return fetch_price_history(symbol=symbol, start=start, end=end, limit=limit)
+    except Exception as e:
+        logger.error(f"Price history query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Price history query error: {str(e)}")
 
 
 if __name__ == "__main__":

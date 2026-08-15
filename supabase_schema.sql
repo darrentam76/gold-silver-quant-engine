@@ -52,3 +52,39 @@ drop policy if exists "anon_select_signal_snapshots" on public.signal_snapshots;
 create policy "anon_select_signal_snapshots"
     on public.signal_snapshots for select
     to anon using (true);
+
+-- =============================================================================
+-- Price History Archive (daily OHLCV bars, one row per symbol per trading day)
+-- =============================================================================
+
+create table if not exists public.price_history_daily (
+    id              bigint generated always as identity primary key,
+    symbol          text not null,           -- GC=F, SI=F, ^TNX, ^TYX, ^IRX, GSR
+    trading_date    date not null,
+    open            double precision,
+    high            double precision,
+    low             double precision,
+    close           double precision,
+    volume          double precision,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now(),
+    unique (symbol, trading_date)
+);
+
+create index if not exists idx_price_history_symbol_date
+    on public.price_history_daily (symbol, trading_date desc);
+create index if not exists idx_price_history_date
+    on public.price_history_daily (trading_date desc);
+
+-- RLS: allow anon + authenticated full access (matches signal_snapshots posture)
+alter table public.price_history_daily enable row level security;
+
+drop policy if exists "anon_all_price_history_daily" on public.price_history_daily;
+create policy "anon_all_price_history_daily"
+    on public.price_history_daily for all
+    to anon using (true) with check (true);
+
+drop policy if exists "authenticated_all_price_history_daily" on public.price_history_daily;
+create policy "authenticated_all_price_history_daily"
+    on public.price_history_daily for all
+    to authenticated using (true) with check (true);

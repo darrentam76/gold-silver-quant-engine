@@ -12,7 +12,9 @@ a FastAPI backend (`intraday_engine.py`) + Streamlit dashboard (`app.py`).
 - **Dashboard (Streamlit)** — live signal terminal, Supabase-backed analytics
   (per-GMT+8-trading-day summaries + charts), and DeepSeek executive commentary.
 - **Persistence (Supabase)** — `signal_snapshots` table, unique per bar
-  (`data_as_of` upsert), with a derived `trading_date_gmt8` column.
+  (`data_as_of` upsert), with a derived `trading_date_gmt8` column. Daily OHLCV
+  bars are mirrored to `price_history_daily` (per-symbol per-trading-day upsert),
+  seeded via the backfill endpoint and refreshed on every fresh 1Y history fetch.
 
 ### API
 
@@ -21,6 +23,10 @@ a FastAPI backend (`intraday_engine.py`) + Streamlit dashboard (`app.py`).
 | `GET /api/v1/signals` | Latest signal state (`breakeven_10y`, `period` params) |
 | `GET /api/v1/history` | Persisted snapshots, newest first (`limit`, `trading_date` params) |
 | `GET /api/v1/history/daily` | Per-GMT+8-trading-day aggregates |
+| `GET /api/v1/live` | Live quotes + yields (`breakeven_10y` param), 10s cache |
+| `GET /api/v1/live/yearly` | 1Y/6M/3M/1M daily history (`period` param), 1h cache |
+| `POST /api/v1/price-history/backfill` | Download & persist daily OHLCV into Supabase (`days` param) |
+| `GET /api/v1/price-history` | Archived daily OHLCV from Supabase (`symbol`/`start`/`end`/`limit` params) |
 | `POST /api/v1/insights` | DeepSeek executive synthesis for a signal payload |
 | `GET /api/v1/reject` | Out-of-scope asset rejection |
 
@@ -45,8 +51,26 @@ The dashboard reads `BACKEND_URL` (default `http://localhost:8000`).
 1. Push this repo to GitHub.
 2. Render → New → Blueprint, connect the repo. `render.yaml` creates the
    `gold-silver-quant-engine` web service automatically.
-3. Set env vars in the service: `SUPABASE_URL`, `SUPABASE_KEY`, `DEEPSEEK_API_KEY`.
+3. During creation Render prompts for the secrets (`sync: false` in
+   `render.yaml`): `SUPABASE_URL`, `SUPABASE_KEY`, `DEEPSEEK_API_KEY`.
 4. Note the service URL, e.g. `https://gold-silver-quant-engine.onrender.com`.
+
+### 3. Post-deploy verification
+
+```bash
+# 1. Backend health (takes ~1 min on first cold start)
+curl "https://gold-silver-quant-engine.onrender.com/api/v1/live?breakeven_10y=2.28"
+
+# 2. Live yearly history
+curl "https://gold-silver-quant-engine.onrender.com/api/v1/live/yearly?period=1y"
+
+# 3. Persistence reachable
+curl "https://gold-silver-quant-engine.onrender.com/api/v1/history?limit=1"
+```
+
+Then open the Streamlit app and confirm the Live prices tab shows
+`MARKET LIVE` / real yields and the Analytics tab is reachable (cold start
+on free tier means first load takes ~1 min).
 
 ### 2. Dashboard on Streamlit Community Cloud
 
