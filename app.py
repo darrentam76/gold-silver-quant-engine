@@ -22,6 +22,25 @@ def to_gmt8(iso_str: str) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(GMT8).strftime("%Y-%m-%d %H:%M:%S")
 
+
+def _style_figure(fig: go.Figure, height: int = 400, margin_top: int = 48, hovermode: str = "x unified") -> go.Figure:
+    """Apply the dashboard's consistent, low-noise chart style."""
+    fig.update_layout(
+        height=height,
+        font=dict(family="Inter, system-ui, sans-serif", size=13, color="#CBD5E1"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=20, r=20, t=margin_top, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, bgcolor="rgba(0,0,0,0)"),
+        hovermode=hovermode,
+        hoverlabel=dict(bgcolor="rgba(15,23,42,0.95)", bordercolor="rgba(148,163,184,0.30)", font=dict(color="#F1F5F9")),
+    )
+    grid = "rgba(148, 163, 184, 0.10)"
+    axis = "rgba(148, 163, 184, 0.22)"
+    fig.update_xaxes(showgrid=True, gridcolor=grid, linecolor=axis, zerolinecolor=axis)
+    fig.update_yaxes(showgrid=True, gridcolor=grid, linecolor=axis, zerolinecolor=axis)
+    return fig
+
 # -----------------------------------------------------------------------------
 # 1. Page Configuration & Theme (colors/fonts live in .streamlit/config.toml)
 # -----------------------------------------------------------------------------
@@ -30,6 +49,70 @@ st.set_page_config(
     page_icon=":material/show_chart:",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# Design system: typography, translucent surfaces, responsive feedback.
+st.html(
+    """
+<style>
+/* Typography — optical sizing, negative tracking & tight leading on headings */
+.stApp {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+}
+.stApp h1 { letter-spacing: -0.025em; line-height: 1.08; }
+.stApp h2 { letter-spacing: -0.02em; line-height: 1.15; }
+.stApp h3 { letter-spacing: -0.015em; line-height: 1.2; }
+
+/* Metric cards — translucent surface, soft depth (shadow over hard border) */
+div[data-testid="stMetric"] {
+    background: rgba(148, 163, 184, 0.06);
+    backdrop-filter: blur(8px) saturate(140%);
+    border: 1px solid rgba(148, 163, 184, 0.16) !important;
+    border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(2, 6, 23, 0.40), 0 10px 28px -14px rgba(0, 0, 0, 0.55);
+    transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (hover: hover) and (pointer: fine) {
+    div[data-testid="stMetric"]:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 2px 4px rgba(2, 6, 23, 0.45), 0 14px 32px -14px rgba(0, 0, 0, 0.60);
+    }
+}
+
+/* Buttons — instant press feedback (scale 0.97, <160ms ease-out) */
+.stButton > button, .stDownloadButton > button {
+    transition: transform 120ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms ease-out, background-color 160ms ease-out;
+    will-change: transform;
+}
+.stButton > button:active, .stDownloadButton > button:active {
+    transform: scale(0.97);
+}
+
+/* Tabs — fast, subtle state change */
+button[data-baseweb="tab"] {
+    transition: background-color 160ms ease-out, color 160ms ease-out;
+}
+
+/* Sticky header — frosted glass edge instead of a hard divider */
+[data-testid="stHeader"] {
+    background: rgba(15, 23, 42, 0.72) !important;
+    backdrop-filter: blur(16px) saturate(180%);
+    box-shadow: none;
+    border-bottom: none;
+}
+
+/* Reduced motion — keep color/opacity, drop movement */
+@media (prefers-reduced-motion: reduce) {
+    div[data-testid="stMetric"],
+    .stButton > button, .stDownloadButton > button,
+    button[data-baseweb="tab"] {
+        transition: none !important;
+        transform: none !important;
+    }
+}
+</style>
+"""
 )
 
 # -----------------------------------------------------------------------------
@@ -41,7 +124,7 @@ with st.sidebar:
     default_backend = os.getenv("BACKEND_URL", "http://localhost:8000")
     backend_url = st.text_input("Backend API URL", value=default_backend).rstrip("/")
 
-    st.divider()
+    st.space("small")
     st.subheader("Model parameters")
 
     breakeven_input = st.number_input(
@@ -62,7 +145,7 @@ with st.sidebar:
     )
     st.caption("Engine thresholds are fixed: macro ±1.5σ, stat-arb ±2.0σ.")
 
-    st.divider()
+    st.space("small")
     if st.button(":material/refresh: Force refresh cache", type="primary", width="stretch"):
         st.cache_data.clear()
         st.rerun()
@@ -189,18 +272,20 @@ signals_data = signals_result["data"]
 # 4. Header & Status Banner
 # -----------------------------------------------------------------------------
 st.title("Gold, Silver & Real Rates Engine")
+st.caption("Quantitative XAU/XAG & yield-curve trading dashboard · backend contract `intraday-v0.2.4`")
 
 timestamp = to_gmt8(signals_data.get("data_as_of"))
 quality = signals_data.get("quality", "UNKNOWN")
 data_source_gold = signals_data.get("data_source_gold", "N/A")
 data_source_silver = signals_data.get("data_source_silver", "N/A")
 
-live_color = "green" if quality == "OK" else "red"
+feed_badge = f":{'green' if quality == 'OK' else 'red'}-badge[● LIVE FEED]"
+quality_badge = f":{'green' if quality == 'OK' else 'orange'}-badge[Quality: {quality}]"
 st.markdown(
-    f":{live_color}-badge[● LIVE FEED] "
-    f"Quality: `{quality}` · Gold feed: `{data_source_gold}` · "
+    f"{feed_badge} {quality_badge} · Gold feed: `{data_source_gold}` · "
     f"Silver feed: `{data_source_silver}` · Updated (GMT+8): `{timestamp}`"
 )
+st.space("small")
 
 # -----------------------------------------------------------------------------
 # 5. Tabbed Navigation
@@ -314,7 +399,9 @@ with tab_regime:
         line_color="#F59E0B",
         annotation_text=f"-{z_threshold:.1f}σ",
     )
-    fig_z.update_layout(height=320, margin=dict(l=20, r=20, t=30, b=20))
+    fig_z.update_yaxes(autorange="reversed")
+    fig_z.update_coloraxes(showscale=False)
+    _style_figure(fig_z, height=320, margin_top=30, hovermode="y")
     st.plotly_chart(fig_z, width="stretch")
 
 # --- TAB 2: LIVE PRICES (auto-refresh, independent of STALE gate) ---
@@ -436,10 +523,10 @@ def yearly_history_panel():
         go.Scatter(x=df["date"], y=df["us3m"], name="3M", line=dict(color="#FBBF24")),
         row=3, col=1,
     )
-    fig_yearly.update_layout(height=780, showlegend=True, margin=dict(l=20, r=20, t=40, b=20))
+    _style_figure(fig_yearly, height=780)
     st.plotly_chart(fig_yearly, width="stretch")
 
-    st.divider()
+    st.space("medium")
     st.subheader("Supabase price archive")
 
     archive = fetch_price_history(backend_url, limit=1)
@@ -564,11 +651,7 @@ with tab_analytics:
                 row=2,
                 col=1,
             )
-            fig_hist.update_layout(
-                height=650,
-                showlegend=True,
-                margin=dict(l=20, r=20, t=40, b=20),
-            )
+            _style_figure(fig_hist, height=650)
             st.plotly_chart(fig_hist, width="stretch")
         else:
             st.warning("No snapshots found for the selected date.", icon=":material/warning:")
