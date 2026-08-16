@@ -16,6 +16,18 @@ a FastAPI backend (`intraday_engine.py`) + Streamlit dashboard (`app.py`).
   bars are mirrored to `price_history_daily` (per-symbol per-trading-day upsert),
   seeded via the backfill endpoint and refreshed on every fresh 1Y history fetch.
 
+```mermaid
+flowchart LR
+    U[Browser / User] -->|HTTPS| F[Frontend · Streamlit<br/>app.py · Community Cloud]
+    F -->|HTTP · BACKEND_URL| B[Backend · FastAPI<br/>intraday_engine.py · Render]
+    B -->|yfinance| Y[Yahoo Finance<br/>GC=F · SI=F · ^TNX/^TYX/^IRX]
+    B -->|upsert| S[(Supabase<br/>signal_snapshots<br/>price_history_daily)]
+    B -->|LLM synthesis| D[DeepSeek API]
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full diagram and data-flow
+explanation.
+
 ### API
 
 | Endpoint | Description |
