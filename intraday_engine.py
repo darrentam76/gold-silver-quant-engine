@@ -995,6 +995,8 @@ class SignalsResponse(BaseModel):
     silver_price: Optional[float] = Field(None, examples=[28.45])
     gsr_ratio: Optional[float] = Field(None, examples=[83.85])
     real_yield_10y: Optional[float] = Field(None, examples=[1.840])
+    real_yield_10y_held: Optional[float] = Field(None, examples=[2.416])
+    real_rate_held_from: Optional[str] = Field(None, examples=["2026-08-14T13:59:00-05:00"])
     slope_10y3m: Optional[float] = Field(None, examples=[-0.410])
     slope_30y10y: Optional[float] = Field(None, examples=[0.290])
     data_source_gold: str = Field(..., examples=["GC=F_PRIMARY"])
