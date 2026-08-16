@@ -28,7 +28,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 
 from dotenv import load_dotenv
 
@@ -49,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger("IntradayQuantEngine")
 
 # System Constants & Disclosure Strings
-ENGINE_VERSION = "intraday-v0.2.5"
+ENGINE_VERSION = "intraday-v0.2.6"
 CACHE_TTL_S = 60
 PROXY_DISCLOSURE = (
     "Intraday 1-minute real rate changes use 10Y nominal yield variance "
@@ -71,6 +71,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_TIMEOUT_S = 30
+CHAT_TIMEOUT_S = 60
 
 WINDOW_1D = 60
 WINDOW_7D = 1440
@@ -973,6 +974,68 @@ def generate_llm_insights(payload: Dict[str, Any]) -> Dict[str, str]:
     return {"model": DEEPSEEK_MODEL, "insight": content.strip()}
 
 
+def generate_chat_reply(
+    message: str,
+    history: List[Dict[str, str]],
+    context_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Stateless DeepSeek chat completion for open-ended macro Q&A. History is
+    supplied by the client; the API key never leaves the backend.
+    """
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is not configured.")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an institutional macro desk analyst specializing in precious metals "
+                "(gold/silver), Treasury yields, real rates, inflation, and cross-asset relative "
+                "value. Answer concisely and objectively, naming drivers and trade-offs. "
+                "No disclaimers, no hype."
+            ),
+        }
+    ]
+    if context_payload:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Current engine signal-state snapshot. The 'quality' field may be STALE when "
+                    "the cash Treasury market is closed; treat null values as unavailable rather "
+                    "than zero:\n"
+                    + json.dumps(context_payload, indent=2, default=str)
+                ),
+            }
+        )
+    for turn in history:
+        role = "assistant" if str(turn.get("role", "")).strip().lower() == "assistant" else "user"
+        messages.append({"role": role, "content": str(turn.get("content", ""))})
+    messages.append({"role": "user", "content": message})
+
+    response = requests.post(
+        DEEPSEEK_BASE_URL,
+        headers={
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "temperature": 0.4,
+            "max_tokens": 800,
+        },
+        timeout=CHAT_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    data = response.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected DeepSeek response shape: {str(e)}")
+    return {"model": DEEPSEEK_MODEL, "reply": content.strip()}
+
+
 # -----------------------------------------------------------------------------
 # FastAPI API Layer & Out-of-Scope Rejection Protocols
 # -----------------------------------------------------------------------------
@@ -1004,6 +1067,19 @@ class SignalsResponse(BaseModel):
     proxy_disclosure: str = Field(..., examples=[PROXY_DISCLOSURE])
     data_as_of: str = Field(..., examples=["2026-08-14T04:00:00+00:00"])
     engine_version: str = Field(..., examples=[ENGINE_VERSION])
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., examples=["user"])
+    content: str = Field(..., examples=["What drives the gold/silver ratio?"])
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000, examples=["Explain the 3M-10Y slope."])
+    history: List[ChatMessage] = Field(default_factory=list, description="Prior turns, oldest first.")
+    context_payload: Optional[Dict[str, Any]] = Field(
+        None, description="Optional signal-state snapshot used to ground the reply."
+    )
 
 
 @app.get("/api/v1/signals", response_model=SignalsResponse)
@@ -1044,6 +1120,37 @@ async def get_insights_endpoint(payload: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Insights generation failed: {str(e)}")
         raise HTTPException(status_code=502, detail=f"Insights generation error: {str(e)}")
+
+
+@app.get("/api/v1/llm/status")
+async def llm_status_endpoint() -> Dict[str, Any]:
+    """Lightweight DeepSeek capability probe (no upstream call)."""
+    return {
+        "configured": bool(DEEPSEEK_API_KEY),
+        "model": DEEPSEEK_MODEL if DEEPSEEK_API_KEY else None,
+        "note": "LLM calls are routed through the backend so the API key never reaches the client.",
+    }
+
+
+@app.post("/api/v1/chat")
+async def chat_endpoint(request: ChatRequest) -> Dict[str, Any]:
+    """
+    Open-ended macro Q&A via DeepSeek chat completions, stateless. The client
+    supplies the conversation history and an optional signal-state snapshot.
+    """
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="DeepSeek API key is not configured (DEEPSEEK_API_KEY)."
+        )
+    try:
+        history = [{"role": m.role, "content": m.content} for m in request.history]
+        return await asyncio.to_thread(
+            generate_chat_reply, request.message, history, request.context_payload
+        )
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM chat error: {str(e)}")
 
 
 @app.get("/api/v1/history")

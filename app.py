@@ -9,7 +9,7 @@ import streamlit as st
 
 GMT8 = timezone(timedelta(hours=8))
 
-UI_BUILD = "held-rate"  # bump on each UI change so deployments are verifiable at a glance
+UI_BUILD = "macro-chat"  # bump on each UI change so deployments are verifiable at a glance
 
 
 def to_gmt8(iso_str: str) -> str:
@@ -152,7 +152,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption("Backend contract: `intraday-v0.2.4`")
+    st.caption("Live engine version is shown in the header.")
 
 # -----------------------------------------------------------------------------
 # 3. API Data Fetching (Strict Fail-Fast Behavior)
@@ -177,6 +177,34 @@ def fetch_insights(url: str, payload: dict) -> dict:
     endpoint = f"{url}/api/v1/insights"
     try:
         response = requests.post(endpoint, json=payload, timeout=15)
+        if response.status_code != 200:
+            return {"error": True, "message": f"Backend API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
+
+def fetch_llm_status(url: str) -> dict:
+    """Probe whether the backend has DeepSeek configured (no upstream call)."""
+    endpoint = f"{url}/api/v1/llm/status"
+    try:
+        response = requests.get(endpoint, timeout=15)
+        if response.status_code != 200:
+            return {"error": True, "message": f"LLM status API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
+
+def fetch_chat(url: str, message: str, history: list, context: dict) -> dict:
+    """Send an open-ended macro question to the backend DeepSeek chat endpoint."""
+    endpoint = f"{url}/api/v1/chat"
+    try:
+        response = requests.post(
+            endpoint,
+            json={"message": message, "history": history, "context_payload": context},
+            timeout=75,
+        )
         if response.status_code != 200:
             return {"error": True, "message": f"Backend API Error ({response.status_code}): {response.text}"}
         return {"error": False, "data": response.json()}
@@ -704,3 +732,48 @@ with tab_llm:
                     with st.container(border=True):
                         st.markdown("### Executive synthesis")
                         st.markdown(insight_text)
+
+    st.space("medium")
+    st.subheader("Macro Q&A chat")
+    st.caption("Ask open-ended macro questions. Answers are grounded on the current signal snapshot (quality may be STALE).")
+
+    llm_status = fetch_llm_status(backend_url)
+    if llm_status["error"] or not llm_status["data"].get("configured"):
+        st.warning(
+            "DeepSeek is not configured on the backend (`DEEPSEEK_API_KEY`). Chat is unavailable.",
+            icon=":material/key_off:",
+        )
+    else:
+        chat_model = llm_status["data"].get("model", "deepseek-chat")
+        st.badge(f"DeepSeek ready · {chat_model}", icon=":material/smart_toy:")
+
+        if "chat_history" not in st.session_state:
+            st.session_state["chat_history"] = []
+
+        for turn in st.session_state["chat_history"]:
+            with st.chat_message(turn["role"]):
+                st.markdown(turn["content"])
+
+        user_input = st.chat_input(
+            "Ask a macro question (e.g. 'What does a 2.4% real 10Y imply for gold?')",
+            key="chat_input_macro",
+        )
+        if user_input and user_input.strip():
+            user_text = user_input.strip()
+            st.session_state["chat_history"].append({"role": "user", "content": user_text})
+            with st.chat_message("user"):
+                st.markdown(user_text)
+            with st.chat_message("assistant"):
+                with st.spinner(f"Thinking via {chat_model}..."):
+                    result = fetch_chat(backend_url, user_text, st.session_state["chat_history"][:-1], signals_data)
+                if result["error"]:
+                    st.error(result["message"], icon=":material/error:")
+                else:
+                    reply = result["data"].get("reply", "No reply returned.")
+                    st.markdown(reply)
+                    st.session_state["chat_history"].append({"role": "assistant", "content": reply})
+
+        if st.session_state["chat_history"]:
+            if st.button(":material/delete: Clear conversation", key="clear_chat"):
+                st.session_state["chat_history"] = []
+                st.rerun()
