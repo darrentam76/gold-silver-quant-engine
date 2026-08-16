@@ -9,7 +9,7 @@ import streamlit as st
 
 GMT8 = timezone(timedelta(hours=8))
 
-UI_BUILD = "c803ea6"  # bump on each UI change so deployments are verifiable at a glance
+UI_BUILD = "9400d56"  # bump on each UI change so deployments are verifiable at a glance
 
 
 def to_gmt8(iso_str: str) -> str:
