@@ -445,6 +445,25 @@ LIVE_QUOTE_TTL_S = 10
 LIVE_FRESH_MIN = 60  # gold/silver feed considered live if last tick < 60 min ago
 
 
+def _futures_market_open(now_utc: pd.Timestamp) -> bool:
+    """COMEX/Globex futures session in America/New_York wall-clock:
+    opens Sunday 18:00 ET, closes Friday 17:00 ET, with a daily maintenance
+    break 17:00-18:00 ET on Monday-Thursday."""
+    try:
+        et = now_utc.tz_convert("America/New_York")
+    except Exception:
+        et = now_utc.tz_convert("Etc/GMT+5")  # EST fallback, never raises
+    dow = et.dayofweek          # 0=Mon .. 6=Sun
+    minute = et.hour * 60 + et.minute
+    if dow == 5:                # Saturday: closed
+        return False
+    if dow == 6:                # Sunday: opens 18:00 ET
+        return minute >= 18 * 60
+    if dow == 4:                # Friday: closes 17:00 ET
+        return minute < 17 * 60
+    return not (17 * 60 <= minute < 18 * 60)  # Mon-Thu daily break
+
+
 def _fetch_live_quotes(breakeven_10y: float = 2.28) -> Dict[str, Any]:
     """
     Returns the latest futures prices (GC=F gold, SI=F silver) plus CBOE
@@ -483,16 +502,15 @@ def _fetch_live_quotes(breakeven_10y: float = 2.28) -> Dict[str, Any]:
             delta = latest_ts.tz_convert(ts.tz) - ts
         return round(delta.total_seconds() / 60.0, 1)
 
-    # Wall-clock staleness + weekend check (feed max timestamp can look "fresh"
-    # even on a closed market, since it equals the last session close).
+    # Wall-clock staleness + futures session check (feed max timestamp can look
+    # "fresh" even on a closed market, since it equals the last session close).
     now_utc = pd.Timestamp.now(tz="UTC")
     if latest_ts.tzinfo is None:
         latest_utc = latest_ts.tz_localize("UTC")
     else:
         latest_utc = latest_ts.tz_convert("UTC")
     age_now_min = (now_utc - latest_utc).total_seconds() / 60.0
-    is_weekend = now_utc.dayofweek >= 5
-    market_open = bool(age_now_min < LIVE_FRESH_MIN and not is_weekend)
+    market_open = bool(age_now_min < LIVE_FRESH_MIN and _futures_market_open(now_utc))
 
     tnx = _clean("^TNX", 3)
     tyx = _clean("^TYX", 3)
