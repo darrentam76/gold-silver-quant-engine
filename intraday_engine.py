@@ -536,6 +536,7 @@ def _fetch_live_quotes(breakeven_10y: float = 2.28) -> Dict[str, Any]:
         "slope_10y3m": slope_10y3m,
         "slope_30y10y": slope_30y10y,
         "market_open": market_open,
+        "staleness_min": round(age_now_min, 1),
         "freshness_min": {
             "gold": gold_age,
             "silver": _age_min("SI=F"),

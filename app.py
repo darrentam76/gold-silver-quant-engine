@@ -450,13 +450,11 @@ def live_prices_panel():
         st.metric("Slope 30Y-10Y", f"{_fmt(d.get('slope_30y10y'), 3)}%", border=True)
 
     st.space("small")
-    freshness = d.get("freshness_min", {})
+    staleness = d.get("staleness_min")
+    staleness_txt = f"{staleness:.0f} min ago" if staleness is not None else "n/a"
     st.caption(
-        "Feed freshness (min since last tick): "
-        + " · ".join(
-            f"{k.upper()}: `{v}`" if v is not None else f"{k.upper()}: n/a"
-            for k, v in freshness.items()
-        )
+        f"**Last tick: {staleness_txt}** · Yahoo's 1m futures feed publishes bars a few minutes "
+        "behind the market · this panel auto-refreshes every 10s"
     )
 
 
