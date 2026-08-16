@@ -9,6 +9,8 @@ import streamlit as st
 
 GMT8 = timezone(timedelta(hours=8))
 
+UI_BUILD = "c803ea6"  # bump on each UI change so deployments are verifiable at a glance
+
 
 def to_gmt8(iso_str: str) -> str:
     """Convert an ISO-8601 timestamp to GMT+8 wall-clock, formatted as YYYY-MM-DD HH:MM:SS."""
@@ -272,7 +274,7 @@ signals_data = signals_result["data"]
 # 4. Header & Status Banner
 # -----------------------------------------------------------------------------
 st.title("Gold, Silver & Real Rates Engine")
-st.caption("Quantitative XAU/XAG & yield-curve trading dashboard · backend contract `intraday-v0.2.4`")
+st.caption(f"Quantitative XAU/XAG & yield-curve trading dashboard · backend contract `intraday-v0.2.4` · ui build `{UI_BUILD}`")
 
 timestamp = to_gmt8(signals_data.get("data_as_of"))
 quality = signals_data.get("quality", "UNKNOWN")
