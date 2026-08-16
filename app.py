@@ -274,7 +274,7 @@ signals_data = signals_result["data"]
 # 4. Header & Status Banner
 # -----------------------------------------------------------------------------
 st.title("Gold, Silver & Real Rates Engine")
-st.caption(f"Quantitative XAU/XAG & yield-curve trading dashboard · backend contract `intraday-v0.2.4` · ui build `{UI_BUILD}`")
+st.caption(f"Quantitative XAU/XAG & yield-curve trading dashboard · backend contract `{signals_data.get('engine_version', 'unknown')}` · ui build `{UI_BUILD}`")
 
 timestamp = to_gmt8(signals_data.get("data_as_of"))
 quality = signals_data.get("quality", "UNKNOWN")
