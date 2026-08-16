@@ -49,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger("IntradayQuantEngine")
 
 # System Constants & Disclosure Strings
-ENGINE_VERSION = "intraday-v0.2.4"
+ENGINE_VERSION = "intraday-v0.2.5"
 CACHE_TTL_S = 60
 PROXY_DISCLOSURE = (
     "Intraday 1-minute real rate changes use 10Y nominal yield variance "
@@ -346,6 +346,17 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
     slope_10y3m = tnx - irx
     slope_30y10y = tyx - tnx
 
+    # Held-last-value real rate: anchors to the most recent valid ^TNX tick so
+    # the dashboard can show a level (e.g. "2.42% held from Fri close") while
+    # the cash Treasury market is off-session and the feed is STALE.
+    tnx_actual = df["^TNX"].dropna()
+    if len(tnx_actual) > 0:
+        real_yield_10y_held = round(float(tnx_actual.iloc[-1]) - breakeven_10y, 3)
+        real_rate_held_from = tnx_actual.index[-1].isoformat()
+    else:
+        real_yield_10y_held = None
+        real_rate_held_from = None
+
     # 5. Z-Score Modalities
     # Macro Velocity Z-Scores (ON CHANGES)
     window = _resolve_window(period)
@@ -390,6 +401,8 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
         "silver_price": _clean_val(silver_ffill, 2),
         "gsr_ratio": _clean_val(gsr_series, 2),
         "real_yield_10y": _clean_val(real_yield_10y, 3),
+        "real_yield_10y_held": real_yield_10y_held,
+        "real_rate_held_from": real_rate_held_from,
         "slope_10y3m": _clean_val(slope_10y3m, 3),
         "slope_30y10y": _clean_val(slope_30y10y, 3),
         "data_source_gold": gold_source,

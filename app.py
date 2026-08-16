@@ -9,7 +9,7 @@ import streamlit as st
 
 GMT8 = timezone(timedelta(hours=8))
 
-UI_BUILD = "9400d56"  # bump on each UI change so deployments are verifiable at a glance
+UI_BUILD = "held-rate"  # bump on each UI change so deployments are verifiable at a glance
 
 
 def to_gmt8(iso_str: str) -> str:
@@ -322,35 +322,54 @@ def _flag_color(flag: str) -> str:
 
 # --- TAB 1: REGIME & SIGNALS ---
 with tab_regime:
-    real_rate = signals_data.get("real_yield_10y") or 0.0
-    rr_z = signals_data.get("rr_z") or 0.0
+    real_rate = signals_data.get("real_yield_10y")
+    real_rate_held = signals_data.get("real_yield_10y_held")
+    real_rate_held_from = signals_data.get("real_rate_held_from")
+    is_held = real_rate is None and real_rate_held is not None
+    real_rate = real_rate if real_rate is not None else real_rate_held
+    real_rate = real_rate if real_rate is not None else 0.0
+    rr_z = signals_data.get("rr_z")
     gold_price = signals_data.get("gold_price") or 0.0
-    gold_z = signals_data.get("gold_z") or 0.0
+    gold_z = signals_data.get("gold_z")
     silver_price = signals_data.get("silver_price") or 0.0
     gsr_ratio = signals_data.get("gsr_ratio") or 0.0
-    gsr_z = signals_data.get("gsr_z") or 0.0
+    gsr_z = signals_data.get("gsr_z")
+
+    def _z(delta_z: Optional[float]) -> str:
+        return "n/a σ" if delta_z is None else f"{delta_z:.2f}σ Z"
 
     with st.container(horizontal=True):
         st.metric(
             "10Y real rate",
             f"{real_rate:.2f}%",
-            delta=f"{rr_z:.2f}σ Z",
+            delta=_z(rr_z),
             delta_color="inverse",
             border=True,
         )
         st.metric(
             "Gold spot",
             f"${gold_price:,.2f}",
-            delta=f"{gold_z:.2f}σ Z",
+            delta=_z(gold_z),
             border=True,
         )
         st.metric("Silver spot", f"${silver_price:,.2f}", border=True)
         st.metric(
             "Gold/silver ratio",
             f"{gsr_ratio:.2f}",
-            delta=f"{gsr_z:.2f}σ Z",
+            delta=_z(gsr_z),
             delta_color="inverse",
             border=True,
+        )
+
+    if is_held:
+        try:
+            held_dt = datetime.fromisoformat(real_rate_held_from.replace("Z", "+00:00"))
+            held_txt = held_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            held_txt = str(real_rate_held_from)
+        st.caption(
+            f"Real rate **held** from last Treasury close ({held_txt}) — "
+            "^TNX off-session. Z-scores return when cash Treasuries resume."
         )
 
     st.space("small")
@@ -373,9 +392,9 @@ with tab_regime:
         {
             "Metric": ["Real rate Z (rr_z)", "Gold Z (gold_z)", "GSR Z (gsr_z)"],
             "Z-Score": [
-                signals_data.get("rr_z", 0.0),
-                signals_data.get("gold_z", 0.0),
-                signals_data.get("gsr_z", 0.0),
+                rr_z if rr_z is not None else float("nan"),
+                gold_z if gold_z is not None else float("nan"),
+                gsr_z if gsr_z is not None else float("nan"),
             ],
         }
     )
