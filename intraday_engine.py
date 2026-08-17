@@ -1,5 +1,5 @@
 """
-intraday_engine.py - Version 0.2.4
+intraday_engine.py - Version 0.2.6
 ===============================================================================
 Institutional Precious Metals (XAU/XAG) & Yield Curve Quantitative Engine
 
@@ -82,6 +82,7 @@ REGIME_EXIT_STREAK = 5      # calm bars before macro state reverts to NEUTRAL
 ARB_Z_THRESHOLD = 2.0       # stat-arb signal flag threshold (z = +-2.0)
 ARB_EXIT_STREAK = 3         # calm bars before arbitrage flag reverts to NONE
 FFILL_LIMIT = 3             # max consecutive forward-filled bars before STALE
+STALE_TNX_WINDOW_MIN = 15   # ^TNX can lag gold/silver up to this many min before rates go STALE
 BASIS_WINDOW = 30           # rolling mean window for futures/spot basis adjustment
 MIN_INGEST_BARS = 5         # minimum bars required to run the pipeline
 MIN_Z_PERIODS = 10          # floor for rolling Z-score min_periods
@@ -329,18 +330,29 @@ def run_intraday_pipeline(breakeven_10y: float = 2.28, period: str = "1d") -> Di
     # Step 2 (literal): GSR joint gating on Gold OR Silver only
     is_stale_gsr = is_stale_gold | is_stale_silver
 
-    # Constraint 3: off-session rates deplete 3-bar budget -> STALE quality
-    is_stale_rates = df["^TNX"].ffill(limit=FFILL_LIMIT).isna()
+    # Constraint 3: time-based ^TNX staleness gate
+    # Yahoo ^TNX 1m data routinely lags gold/silver by 3-5 min; the old ffill(3)
+    # gate treated any 4-bar gap as STALE, which fired spuriously during regular
+    # hours. Switched to wall-clock lag: rates go STALE only when ^TNX is more
+    # than STALE_TNX_WINDOW_MIN behind the latest gold/silver bar.
+    tnx_valid = df["^TNX"].dropna()
+    if len(tnx_valid) > 0 and len(df) > 0:
+        tnx_lag_min = (df.index[-1] - tnx_valid.index[-1]).total_seconds() / 60.0
+        is_stale_rates = tnx_lag_min > STALE_TNX_WINDOW_MIN
+    else:
+        is_stale_rates = True
     is_stale = is_stale_gsr | is_stale_rates
 
     # Compute GSR on gold/silver-valid bars only (Step 2)
     gsr_series = pd.Series(np.nan, index=df.index)
     gsr_series[~is_stale_gsr] = gold_ffill[~is_stale_gsr] / silver_ffill[~is_stale_gsr]
 
-    # Forward-fill Treasury feeds with 3-bar budget
-    tnx = df["^TNX"].ffill(limit=FFILL_LIMIT)
-    tyx = df["^TYX"].ffill(limit=FFILL_LIMIT)
-    irx = df["^IRX"].ffill(limit=FFILL_LIMIT)
+    # Forward-fill Treasury feeds — use a wider budget than gold/silver because
+    # Yahoo ^TNX 1m data routinely lags futures by 3-5 bars.
+    tnx_flimit = max(FFILL_LIMIT, STALE_TNX_WINDOW_MIN)
+    tnx = df["^TNX"].ffill(limit=tnx_flimit)
+    tyx = df["^TYX"].ffill(limit=tnx_flimit)
+    irx = df["^IRX"].ffill(limit=tnx_flimit)
 
     # 4. Yield Curve & Proxy Real Rates
     real_yield_10y = tnx - breakeven_10y
