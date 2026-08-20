@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 import requests
 import pandas as pd
@@ -196,17 +197,28 @@ def fetch_llm_status(url: str) -> dict:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
 
 
-def fetch_chat(url: str, message: str, history: list, context: dict) -> dict:
+def fetch_chat(url: str, message: str, history: list, context: dict, session_id: str = None) -> dict:
     """Send an open-ended macro question to the backend DeepSeek chat endpoint."""
     endpoint = f"{url}/api/v1/chat"
     try:
-        response = requests.post(
-            endpoint,
-            json={"message": message, "history": history, "context_payload": context},
-            timeout=75,
-        )
+        payload = {"message": message, "history": history, "context_payload": context}
+        if session_id:
+            payload["session_id"] = session_id
+        response = requests.post(endpoint, json=payload, timeout=75)
         if response.status_code != 200:
             return {"error": True, "message": f"Backend API Error ({response.status_code}): {response.text}"}
+        return {"error": False, "data": response.json()}
+    except requests.exceptions.RequestException as e:
+        return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
+
+
+def fetch_chat_history(url: str, session_id: str, limit: int = 100) -> dict:
+    """Fetch persisted chat history for a session from backend."""
+    endpoint = f"{url}/api/v1/chat/history"
+    try:
+        response = requests.get(endpoint, params={"session_id": session_id, "limit": limit}, timeout=30)
+        if response.status_code != 200:
+            return {"error": True, "message": f"Chat History API Error ({response.status_code}): {response.text}"}
         return {"error": False, "data": response.json()}
     except requests.exceptions.RequestException as e:
         return {"error": True, "message": f"Connection Error: Could not reach backend at `{endpoint}` ({e})"}
@@ -735,7 +747,7 @@ with tab_llm:
 
     st.space("medium")
     st.subheader("Macro Q&A chat")
-    st.caption("Ask open-ended macro questions. Answers are grounded on the current signal snapshot (quality may be STALE).")
+    st.caption("Ask open-ended macro questions. Answers are grounded on the current signal snapshot (quality may be STALE). Exchanges are saved to Supabase for your records.")
 
     llm_status = fetch_llm_status(backend_url)
     if llm_status["error"] or not llm_status["data"].get("configured"):
@@ -747,8 +759,16 @@ with tab_llm:
         chat_model = llm_status["data"].get("model", "deepseek-chat")
         st.badge(f"DeepSeek ready · {chat_model}", icon=":material/smart_toy:")
 
+        if "chat_session_id" not in st.session_state:
+            st.session_state["chat_session_id"] = str(uuid.uuid4())
+
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
+            hist = fetch_chat_history(backend_url, st.session_state["chat_session_id"])
+            if not hist["error"]:
+                for row in hist["data"].get("rows", []):
+                    st.session_state["chat_history"].append({"role": "user", "content": row["user_message"]})
+                    st.session_state["chat_history"].append({"role": "assistant", "content": row["assistant_reply"]})
 
         for turn in st.session_state["chat_history"]:
             with st.chat_message(turn["role"]):
@@ -765,7 +785,12 @@ with tab_llm:
                 st.markdown(user_text)
             with st.chat_message("assistant"):
                 with st.spinner(f"Thinking via {chat_model}..."):
-                    result = fetch_chat(backend_url, user_text, st.session_state["chat_history"][:-1], signals_data)
+                    result = fetch_chat(
+                        backend_url, user_text,
+                        st.session_state["chat_history"][:-1],
+                        signals_data,
+                        session_id=st.session_state["chat_session_id"],
+                    )
                 if result["error"]:
                     st.error(result["message"], icon=":material/error:")
                 else:

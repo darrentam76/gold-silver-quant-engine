@@ -88,3 +88,32 @@ drop policy if exists "authenticated_all_price_history_daily" on public.price_hi
 create policy "authenticated_all_price_history_daily"
     on public.price_history_daily for all
     to authenticated using (true) with check (true);
+
+-- =============================================================================
+-- Chat History (DeepSeek Q&A log, one row per exchange)
+-- =============================================================================
+
+create table if not exists public.chat_log (
+    id              bigint generated always as identity primary key,
+    created_at      timestamptz not null default now(),
+    session_id      text not null,
+    user_message    text not null,
+    assistant_reply text not null,
+    quality         text,
+    engine_version  text
+);
+
+create index if not exists idx_chat_log_session
+    on public.chat_log (session_id, created_at desc);
+
+alter table public.chat_log enable row level security;
+
+drop policy if exists "anon_all_chat_log" on public.chat_log;
+create policy "anon_all_chat_log"
+    on public.chat_log for all
+    to anon using (true) with check (true);
+
+drop policy if exists "authenticated_all_chat_log" on public.chat_log;
+create policy "authenticated_all_chat_log"
+    on public.chat_log for all
+    to authenticated using (true) with check (true);

@@ -63,6 +63,7 @@ ALLOWED_PERIODS = {"1d", "5d", "7d"}
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = "signal_snapshots"
+CHAT_LOG_TABLE = "chat_log"
 PRICE_HISTORY_TABLE = "price_history_daily"
 PERSISTENCE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
@@ -799,6 +800,42 @@ def fetch_history(limit: int = 200, trading_date: Optional[str] = None) -> Dict[
     return {"count": len(resp.data), "rows": resp.data}
 
 
+def persist_chat(session_id: str, user_message: str, assistant_reply: str,
+                 quality: Optional[str] = None, engine_version: Optional[str] = None) -> None:
+    """Best-effort append of one chat exchange to Supabase."""
+    if not PERSISTENCE_ENABLED:
+        return
+    try:
+        client = _get_supabase()
+        if client is None:
+            return
+        client.table(CHAT_LOG_TABLE).insert({
+            "session_id": session_id,
+            "user_message": user_message,
+            "assistant_reply": assistant_reply,
+            "quality": quality,
+            "engine_version": engine_version,
+        }).execute()
+    except Exception as e:
+        logger.error(f"Chat log persistence failed (non-fatal): {str(e)}")
+
+
+def fetch_chat_history(session_id: str, limit: int = 100) -> Dict[str, Any]:
+    """Returns chat history for a session, oldest first."""
+    client = _get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase persistence is not configured.")
+    resp = (
+        client.table(CHAT_LOG_TABLE)
+        .select("created_at, user_message, assistant_reply, quality")
+        .eq("session_id", session_id)
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    return {"count": len(resp.data), "rows": resp.data}
+
+
 def fetch_daily_summary(limit: int = 30) -> Dict[str, Any]:
     """
     Aggregates signal snapshots by GMT+8 trading day: snapshot count, OK/STALE
@@ -1099,6 +1136,7 @@ class ChatRequest(BaseModel):
     context_payload: Optional[Dict[str, Any]] = Field(
         None, description="Optional signal-state snapshot used to ground the reply."
     )
+    session_id: Optional[str] = Field(None, description="Client-generated session UUID for chat archival.")
 
 
 @app.get("/api/v1/signals", response_model=SignalsResponse)
@@ -1156,6 +1194,7 @@ async def chat_endpoint(request: ChatRequest) -> Dict[str, Any]:
     """
     Open-ended macro Q&A via DeepSeek chat completions, stateless. The client
     supplies the conversation history and an optional signal-state snapshot.
+    Each exchange is best-effort persisted to Supabase for user-controlled archival.
     """
     if not DEEPSEEK_API_KEY:
         raise HTTPException(
@@ -1164,12 +1203,34 @@ async def chat_endpoint(request: ChatRequest) -> Dict[str, Any]:
         )
     try:
         history = [{"role": m.role, "content": m.content} for m in request.history]
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             generate_chat_reply, request.message, history, request.context_payload
         )
+        if request.session_id and PERSISTENCE_ENABLED:
+            quality = (request.context_payload or {}).get("quality")
+            await asyncio.to_thread(
+                persist_chat, request.session_id, request.message,
+                result.get("reply", ""), quality, ENGINE_VERSION,
+            )
+        return result
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"LLM chat error: {str(e)}")
+
+
+@app.get("/api/v1/chat/history")
+async def get_chat_history_endpoint(
+    session_id: str = Query(..., description="Session UUID to retrieve"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Returns persisted chat history for a session, oldest first."""
+    if not PERSISTENCE_ENABLED:
+        raise HTTPException(status_code=503, detail="Supabase persistence is not configured.")
+    try:
+        return fetch_chat_history(session_id=session_id, limit=limit)
+    except Exception as e:
+        logger.error(f"Chat history query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat history error: {str(e)}")
 
 
 @app.get("/api/v1/history")
