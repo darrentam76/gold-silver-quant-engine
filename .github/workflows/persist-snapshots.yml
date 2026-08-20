@@ -1,0 +1,16 @@
+name: Persist Signal Snapshots
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"  # every 5 minutes (GitHub Actions minimum)
+  workflow_dispatch:        # manual trigger
+
+jobs:
+  persist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping cron/persist endpoint
+        run: |
+          curl -sf "https://gold-silver-quant-engine.onrender.com/api/v1/cron/persist" \
+            && echo "Persist OK" \
+            || echo "Persist failed (Render may be waking up)"
