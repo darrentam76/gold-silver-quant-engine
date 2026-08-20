@@ -759,8 +759,9 @@ def persist_payload(payload: Dict[str, Any], breakeven_10y: float, period: str) 
         client = _get_supabase()
         if client is None:
             return
+        data_as_of = payload["data_as_of"]
         row = {
-            "data_as_of": payload["data_as_of"],
+            "data_as_of": data_as_of,
             "signal_tag": payload["signal_tag"],
             "arb_flag": payload["arb_flag"],
             "quality": payload["quality"],
@@ -1300,6 +1301,35 @@ async def get_price_history_endpoint(
     except Exception as e:
         logger.error(f"Price history query failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Price history query error: {str(e)}")
+
+
+@app.get("/api/v1/cron/persist")
+async def cron_persist_endpoint():
+    """
+    Lightweight archival trigger for external cron services (e.g. GitHub Actions,
+    cron-job.org) to ping every 60 seconds. Uses the existing signals cache when
+    fresh; only runs the pipeline when the cache is stale. Returns a simple status
+    JSON so the caller can log success/failure.
+
+    Usage (GitHub Actions cron / cron-job.org):
+      GET https://<render-host>/api/v1/cron/persist
+    """
+    if not PERSISTENCE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase persistence is not configured."
+        )
+    try:
+        payload = await cache_manager.get_signals(breakeven_10y=2.28, period="1d")
+        return {
+            "status": "ok",
+            "data_as_of": payload.get("data_as_of"),
+            "quality": payload.get("quality"),
+            "engine_version": payload.get("engine_version"),
+        }
+    except Exception as e:
+        logger.error(f"Cron persist failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Cron persist error: {str(e)}")
 
 
 if __name__ == "__main__":
